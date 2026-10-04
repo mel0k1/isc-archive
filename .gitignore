@@ -1,0 +1,9 @@
+*.o
+*.a
+isc
+*.isc
+*.tar
+*.gz
+*.xz
+bench-corpus/
+tests/tmp/
