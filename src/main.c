@@ -1,11 +1,11 @@
 /* main.c — isc: утилита для формата ISCF (.isc) */
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE   /* иначе мак спрячет _SC_NPROCESSORS_ONLN */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#ifdef __APPLE__
-#include <sys/sysctl.h>
-#endif
 #include "archive.h"
 #include "block.h"
 #include "lzi.h"
@@ -65,15 +65,8 @@ static int parse_jobs(int argc, char **argv, int *i, int *jobs)
 
 static int auto_jobs(void)
 {
-#ifdef __APPLE__
-    /* на маке _SC_NPROCESSORS_ONLN спрятан за POSIX-режимом */
-    int n = 0;
-    size_t sz = sizeof n;
-    if (sysctlbyname("hw.ncpu", &n, &sz, 0, 0) != 0 || n < 1) n = 1;
-#else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     if (n < 1) n = 1;
-#endif
     if (n > 16) n = 16;
     return (int)n;
 }
