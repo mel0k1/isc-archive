@@ -33,6 +33,10 @@ pcm = b''.join(struct.pack('<h', int(20000 * math.sin(2*math.pi*440*i/44100)
 open('sound.pcm','wb').write(pcm)
 # int32 счётчик — дельта с шагом 4
 open('counter.i32','wb').write(struct.pack('<50000i', *(i*7 + (i >> 8) for i in range(50000))))
+# лог с повторяющимися строками — rep-дистанции
+open('rep.log','w').write(''.join(
+    '2026-10-04 12:00:00 INFO request id=%d ok\n  user=ivan action=ping ms=%d\n' % (i // 100, i % 50)
+    for i in range(20000)))
 EOF
 
 for L in 1 3 6 9; do

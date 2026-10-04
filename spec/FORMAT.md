@@ -59,6 +59,7 @@ u32   comp_size               payload length, ≤ 2 MiB + 64 KiB
 u32   raw_size                ≤ 1 MiB
 u32   isum                    isum32 of the RAW block
 u8    recipe                  0 store · 1 rle · 2 lz-text · 3 lz-bin · 4 delta
+                              5 lz2-text · 6 lz2-bin · 7 lz2-delta
 u8    reserved[3]
 ```
 
@@ -78,8 +79,13 @@ Every block is routed independently by the packer (values are a v1 guideline):
   `step ∈ {1, 2, 4, 8}`. Decode: run LZI, then `out[i] += out[i - step]` for `i ≥ step`.
   Encode: `out[i] = in[i] − in[i − step]`, then LZI. The router picks the step that collapses
   block entropy the most (16-bit PCM likes step 2, `int32` arrays step 4).
+- `lz2-text` / `lz2-bin` — the LZ2 stream of §8: the same LZI match model plus rep distances,
+  with a selectable entropy backend (canonical Huffman or the RISC range coder). The two
+  recipes differ only in encoder effort (text allows lazy matching from level 4, binary from
+  level 6; text adds +32 to nice-len).
+- `lz2-delta` — delta pre-filter followed by an LZ2 stream: payload `[step u8][LZ2 stream]`.
 
-## 6. LZI bit stream
+## 6. LZI bit stream (recipes 2/3/4)
 
 | Element | Format |
 |---------|--------|
@@ -135,7 +141,59 @@ u8    payload[payload_len]   331 code lengths, RLE codec of §5 (mode 1) or raw 
 Static trees (dyn flag = 0): all 291 literal/length codes are 9 bits, all 40 distance codes
 are 6 bits, both assigned canonically.
 
-## 8. Footer (16 bytes)
+## 8. LZ2 stream (recipes 5/6/7)
+
+LZ2 upgrades the token model with **rep distances** — an MRU queue of the last 4 distances
+(rep0..rep3, all initialised to 1). A match may be coded as a rep match: it references a
+queue entry instead of an explicit distance, costing no distance slot and no extra bits.
+Queue update rules (encoder and decoder must match exactly):
+
+- a match with a new distance `d` moves `d` to the front (rep0); a distance already in the
+  queue moves to the front;
+- a rep match with index `rn` moves `rep[rn]` to the front;
+- literals leave the queue unchanged.
+
+The distance alphabet is extended from 40 to **44 symbols**: 40..43 mean rep0..rep3 and
+never carry extra bits.
+
+The stream starts with a 1-byte **entropy backend selector**:
+
+### mode 1 — canonical Huffman
+
+```
+u8    mode = 1
+trees                    §7-style container, 335 lengths (291 literal/length + 44 distance)
+bit stream               same interleave as §6, ends with EOB (256)
+```
+
+### mode 2 — RISC, the house rANS coder
+
+RISC is a byte-oriented rANS coder: 32-bit state, scale 12 (frequency sum = 4096), lower
+renormalisation bound 2²³, bytes emitted backwards. Two independent streams per block:
+stream A codes the 291-symbol token alphabet, stream B the 44-symbol distance alphabet.
+The encoder processes symbols in reverse order (rANS is LIFO); the decoder walks forward.
+
+```
+u8    mode = 2
+u8    freq_table_A          291 entries: per symbol 0 = absent, 255 = u16 LE follows,
+                            else the frequency itself; sum of frequencies = 4096
+u8    freq_table_B          same layout, 44 entries
+u24   len_A                 byte length of stream A
+u24   len_B                 byte length of stream B
+u8    extras                raw LSB-first bits: per match LEN_EBITS bits, then
+                            DST_EBITS bits for non-rep distances
+u8    stream_A[len_A]       token symbols, RISC-coded
+u8    stream_B[len_B]       distance symbols, RISC-coded
+```
+
+Decoder steps: symbol from A (literal / EOB / length slot), raw length extras from the
+extras stream, then — for matches — a symbol from B: 40..43 are rep matches (no extras),
+0..39 are explicit distances followed by their raw extras.
+
+The encoder computes both backends and keeps the smaller one (RISC tables cost ~0.3 KiB,
+so tiny blocks stay with Huffman).
+
+## 9. Footer (16 bytes)
 
 | Offset | Size | Field |
 |-------:|-----:|-------|
@@ -144,7 +202,7 @@ are 6 bits, both assigned canonically.
 | 8  | 4 | reserved |
 | 12 | 4 | footer_sum — isum32 over bytes 0..11 |
 
-## 9. isum — the house checksum
+## 10. isum — the house checksum
 
 ```
 isum32(h, data):  for each byte b:  h = (h XOR b) × 0x01000193   (mod 2³²)
@@ -156,7 +214,7 @@ isum64(h, data):  h = (h XOR b) × 0x100000001B3                    (mod 2⁶⁴
 isum is an integrity checksum, not a cryptographic hash. The isfp fingerprint (dedup) is
 isum64 over the whole file with size as a secondary key.
 
-## 10. Verification rules
+## 11. Verification rules
 
 A conforming decoder MUST reject: wrong magic/version, bad header/footer sums, bad entry
 sums, `raw_size > 1 MiB` or `comp_size > 2 MiB + 64 KiB` in the index, names containing
@@ -187,16 +245,18 @@ sums, `raw_size > 1 MiB` or `comp_size > 2 MiB + 64 KiB` in the index, names con
 побеждает первое вхождение, у последующих совпадает размер и отпечаток.
 
 **Индекс блока**: `comp_size u32`, `raw_size u32`, `isum u32` (сырого блока), рецепт
-(`0 store`, `1 rle`, `2 lz-text`, `3 lz-bin`, `4 delta`), 3 резервных байта. Даёт случайный доступ.
+(`0 store`, `1 rle`, `2 lz-text`, `3 lz-bin`, `4 delta`, `5 lz2-text`, `6 lz2-bin`,
+`7 lz2-delta`), 3 резервных байта. Даёт случайный доступ.
 
 **Рецепты**. Каждые 1 МиБ маршрутизатор решает сам: блок < 192 Б или энтропия > 7.85 бит/байт
 или нет выгоды ≥ 1/64 → `store`; ≥ 55% байт в сериях ≥ 4 → `rle`; ≥ 87% печатных (UTF-8
-учитывается) → `lz-text`; иначе `lz-bin`; числовые ряды → `delta`: выбирается шаг 1/2/4/8,
-сильнее всего обваливающий энтропию, payload = `[шаг u8][поток LZI]`, декод — LZI, затем
-`out[i] += out[i − шаг]`. Кодек `rle`: `0x00` — конец, `0x01..0x7F` — столько
+учитывается) → `lz2-text`; иначе `lz2-bin`; числовые ряды → `lz2-delta`: выбирается шаг
+1/2/4/8, сильнее всего обваливающий энтропию, payload = `[шаг u8][поток LZ2]`, декод — LZ2,
+затем `out[i] += out[i − шаг]`. Рецепты 2/3/4 (поток LZI) устарели и поддерживаются только
+для чтения старых архивов. Кодек `rle`: `0x00` — конец, `0x01..0x7F` — столько
 литеральных байт, `0x80|k` — следующий байт повторить `k+4` раз (серии 4..131).
 
-**Поток LZI** (рецепты 2 и 3): байт-флаг деревьев (0 статические, 1 динамические), при
+**Поток LZI** (рецепты 2–4): байт-флаг деревьев (0 статические, 1 динамические), при
 динамических — блок деревьев (`u16 total=331`, `u8 mode`, `u16 len`, полезная нагрузка — 331
 длина кода нашим RLE или как есть), затем токены до символа EOB (256):
 
@@ -213,6 +273,50 @@ sums, `raw_size > 1 MiB` or `comp_size > 2 MiB + 64 KiB` in the index, names con
 (0..255 литералы, 256 EOB, 257..290 слоты длин) и дистанционный из 40. Лимит длины кода —
 15 бит; декодер держит LUT на 9 бит с каноническим медленным путём. Статические деревья:
 все литератные коды по 9 бит, все дистанционные по 6.
+
+## Поток LZ2 (рецепты 5/6/7)
+
+LZ2 добавляет к модели совпадений **rep-дистанции** — MRU-очередь четырёх последних
+дистанций (rep0..rep3, все инициализированы единицей). Совпадение можно закодировать как
+rep-матч: он ссылается на элемент очереди вместо явной дистанции, не тратя слот дистанции
+и экстра-биты. Правила очереди (энкодер и декодер обязаны совпадать):
+
+- матч с новой дистанцией `d` двигает `d` в голову (rep0); дистанция уже в очереди —
+  тоже двигается в голову;
+- rep-матч с номером `rn` двигает `rep[rn]` в голову;
+- литералы очередь не трогают.
+
+Дистанционный алфавит расширен с 40 до **44 символов**: 40..43 — это rep0..rep3,
+экстра-битов у них никогда нет.
+
+Поток начинается с байта **выбора энтрокодека**:
+
+**Режим 1 — канонический Хаффман**: байт `1`, затем контейнер деревьев как для LZI, но на
+335 длин (291 литерал/длина + 44 дистанции), затем битовый поток как в LZI до EOB (256).
+
+**Режим 2 — RISC, наш rANS-кодер**: байто-ориентированный rANS: 32-битное состояние,
+scale 12 (сумма частот = 4096), нижняя граница ренормализации 2²³, байты пишутся назад.
+Два независимых потока: A — алфавит токенов (291), B — алфавит дистанций (44). Энкодер
+обрабатывает символы в обратном порядке (rANS — LIFO), декодер идёт вперёд.
+
+```
+u8    mode = 2
+u8    таблица_A             291 запись: 0 = символа нет, 255 = дальше u16 LE,
+                            иначе сама частота; сумма частот = 4096
+u8    таблица_B             то же, 44 записи
+u24   len_A                 длина потока A в байтах
+u24   len_B                 длина потока B в байтах
+u8    экстры                сырые LSB-first биты: на каждый матч LEN_EBITS битов длины,
+                            затем DST_EBITS битов дистанции (не rep)
+u8    поток_A[len_A]        символы токенов, RISC
+u8    поток_B[len_B]        символы дистанций, RISC
+```
+
+Шаги декодера: символ из A (литерал / EOB / слот длины), сырые экстра-биты длины, затем
+для матчей символ из B: 40..43 — rep-матчи (без экстр), 0..39 — явные дистанции с экстрами.
+
+Энкодер считает оба режима и оставляет меньший (таблицы RISC стоят ~0.3 КиБ, поэтому
+маленькие блоки остаются на Хаффмане).
 
 **Подвал**: `"FSCI"`, `raw_sum u32` — isum32 всех сырых байт всех записей-файлов по порядку,
 резерв, `footer_sum u32` — isum32 первых 12 байт подвала.
