@@ -58,7 +58,7 @@ equal `fp` become links.
 u32   comp_size               payload length, ≤ 2 MiB + 64 KiB
 u32   raw_size                ≤ 1 MiB
 u32   isum                    isum32 of the RAW block
-u8    recipe                  0 store · 1 rle · 2 lz-text · 3 lz-bin
+u8    recipe                  0 store · 1 rle · 2 lz-text · 3 lz-bin · 4 delta
 u8    reserved[3]
 ```
 
@@ -74,6 +74,10 @@ Every block is routed independently by the packer (values are a v1 guideline):
   `0x80|k` — repeat the next byte `k + 4` times (k ∈ 0..127, runs 4..131).
 - `lz-text` / `lz-bin` — the LZI bit stream below. The two recipes differ only in encoder
   effort (text allows lazy matching from level 4, binary from level 6; text adds +32 to nice-len).
+- `delta` — the pre-filter for numeric data. Payload is `[step u8][LZI bit stream]` with
+  `step ∈ {1, 2, 4, 8}`. Decode: run LZI, then `out[i] += out[i - step]` for `i ≥ step`.
+  Encode: `out[i] = in[i] − in[i − step]`, then LZI. The router picks the step that collapses
+  block entropy the most (16-bit PCM likes step 2, `int32` arrays step 4).
 
 ## 6. LZI bit stream
 
@@ -183,11 +187,13 @@ sums, `raw_size > 1 MiB` or `comp_size > 2 MiB + 64 KiB` in the index, names con
 побеждает первое вхождение, у последующих совпадает размер и отпечаток.
 
 **Индекс блока**: `comp_size u32`, `raw_size u32`, `isum u32` (сырого блока), рецепт
-(`0 store`, `1 rle`, `2 lz-text`, `3 lz-bin`), 3 резервных байта. Даёт случайный доступ.
+(`0 store`, `1 rle`, `2 lz-text`, `3 lz-bin`, `4 delta`), 3 резервных байта. Даёт случайный доступ.
 
 **Рецепты**. Каждые 1 МиБ маршрутизатор решает сам: блок < 192 Б или энтропия > 7.85 бит/байт
 или нет выгоды ≥ 1/64 → `store`; ≥ 55% байт в сериях ≥ 4 → `rle`; ≥ 87% печатных (UTF-8
-учитывается) → `lz-text`; иначе `lz-bin`. Кодек `rle`: `0x00` — конец, `0x01..0x7F` — столько
+учитывается) → `lz-text`; иначе `lz-bin`; числовые ряды → `delta`: выбирается шаг 1/2/4/8,
+сильнее всего обваливающий энтропию, payload = `[шаг u8][поток LZI]`, декод — LZI, затем
+`out[i] += out[i − шаг]`. Кодек `rle`: `0x00` — конец, `0x01..0x7F` — столько
 литеральных байт, `0x80|k` — следующий байт повторить `k+4` раз (серии 4..131).
 
 **Поток LZI** (рецепты 2 и 3): байт-флаг деревьев (0 статические, 1 динамические), при
