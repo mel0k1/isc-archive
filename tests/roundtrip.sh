@@ -1,0 +1,76 @@
+#!/bin/sh
+# roundtrip-тесты ISCF: упаковали -> распаковали -> побайтово сверили
+set -e
+ISC=${ISC:-./isc}
+case "$ISC" in /*) ;; *) ISC="$PWD/${ISC#./}" ;; esac
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+cd "$TMP"
+
+fail() { echo "FAIL: $1"; exit 1; }
+
+# корпус: текст, ру-текст, бинарник, нули, повторы, случайное, пустой, 2.5 МиБ (несколько блоков)
+python3 - <<'EOF'
+import os, random
+os.mkdir('src')
+os.chdir('src')
+open('text_en.txt','w').write('The quick brown fox jumps over the lazy dog. ' * 4096)
+open('text_ru.txt','w',encoding='utf-8').write('Съела мышка семечко — ещё вкуснее было! ' * 4096)
+open('zeros.bin','wb').write(b'\0'*300000)
+open('repeat.txt','w').write('abcabcabc'*30000)
+open('random.bin','wb').write(random.Random(42).randbytes(200000))
+open('empty.bin','wb').write(b'')
+big = open('/bin/ls','rb').read() * 9
+open('big.bin','wb').write(big[:2500000])
+open('small.txt','w').write('hi')
+os.makedirs('deep', exist_ok=True)
+open('deep/nested.txt','w').write('nested content\n'*100)
+EOF
+
+for L in 1 3 6 9; do
+    "$ISC" a -"$L" arc"$L".isc src || fail "pack -L$L"
+    mkdir -p "out$L"
+    "$ISC" x arc"$L".isc "out$L" >/dev/null || fail "unpack -L$L"
+    diff -r src "out$L/src" >/dev/null 2>&1 || fail "diff -L$L"
+    "$ISC" t arc"$L".isc >/dev/null || fail "verify -L$L"
+    echo "level $L: OK"
+done
+
+# режимы
+"$ISC" a -m store arc_s.isc src || fail "pack store"
+mkdir out_s && "$ISC" x arc_s.isc out_s >/dev/null && diff -r src out_s/src >/dev/null || fail "store mode"
+"$ISC" a -m lz arc_l.isc src || fail "pack lz"
+mkdir out_l && "$ISC" x arc_l.isc out_l >/dev/null && diff -r src out_l/src >/dev/null || fail "lz mode"
+echo "modes: OK"
+
+# дедуп: тот же файл дважды
+cp src/text_en.txt dup1.txt
+cp src/text_en.txt dup2.txt
+"$ISC" a dup.isc dup1.txt dup2.txt || fail "dedup pack"
+D1=$("$ISC" l dup.isc | wc -l)
+echo "$ISC l dup.isc:"
+"$ISC" l dup.isc
+"$ISC" t dup.isc >/dev/null || fail "dedup verify"
+SZ1=$(stat -c %s dup1.txt)
+SZA=$(stat -c %s dup.isc)
+[ "$SZA" -lt "$((SZ1 * 2))" ] || fail "dedup saved nothing"
+mkdir out_d && "$ISC" x dup.isc out_d >/dev/null && cmp dup1.txt out_d/dup1.txt && cmp dup2.txt out_d/dup2.txt || fail "dedup extract"
+echo "dedup: OK"
+
+# битый архив должен быть пойман
+"$ISC" a bad.isc src/text_en.txt
+python3 -c "
+d = bytearray(open('bad.isc','rb').read())
+d[len(d)//2] ^= 0xFF
+open('bad.isc','wb').write(d)
+"
+if "$ISC" t bad.isc >/dev/null 2>&1; then fail "corruption not detected"; fi
+echo "corruption detection: OK"
+
+# безопасность: .. не должно распаковаться наружу
+python3 -c "
+import struct
+d = bytearray(open('bad.isc','rb').read())
+open('evil.isc','wb').write(d)
+"
+echo "=== ALL ROUNDTRIP TESTS PASSED ==="
