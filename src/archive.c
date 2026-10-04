@@ -46,60 +46,78 @@ static void patch_entry(FILE *f, u64 ent_off, size_t nlen, u8 type, u8 recipe, u
 
 int arch_write(const char *out, char **paths, size_t npaths, int level, int mode)
 {
+    int rc = 0;
+    FILE *f = NULL, *src = NULL;
+    u8 *in = NULL, *outb = NULL, *dbuf = NULL;
+    i32 *head = NULL, *prev = NULL;
+    u32 *tl = NULL, *td = NULL;
+    FPE *map = NULL;
+    u64 *sizes = NULL, *fps = NULL, *ent_off = NULL;
+    u32 *link_to = NULL;
+    size_t *nlen = NULL;
     char **names = NULL;
-    size_t cnt = 0, cap = 0;
+    size_t cnt = 0, cap = 0, nall = 0;
+
     for (size_t i = 0; i < npaths; i++)
         if (collect_path(paths[i], &names, &cnt, &cap)) {
             fprintf(stderr, "isc: не открыть '%s'\n", paths[i]);
-            return 2;
+            nall = cnt;
+            rc = 2;
+            goto done;
         }
+    nall = cnt;
 
-    u64 *sizes = calloc(cnt ? cnt : 1, sizeof(u64));
+    sizes = calloc(cnt ? cnt : 1, sizeof(u64));
+    if (!sizes) { rc = 2; goto done; }
     size_t keep = 0;
     for (size_t i = 0; i < cnt; i++) {
         char nm[4096];
         snprintf(nm, sizeof nm, "%s", names[i]);
-        if (sane_name(nm) || !strcmp(nm, out)) { free(names[i]); continue; }
+        if (sane_name(nm) || !strcmp(nm, out)) { free(names[i]); names[i] = 0; continue; }
         struct stat st;
         if (stat(names[i], &st) || !S_ISREG(st.st_mode)) {
             fprintf(stderr, "isc: пропускаю '%s'\n", names[i]);
-            free(names[i]);
+            free(names[i]); names[i] = 0;
             continue;
         }
         sizes[keep] = (u64)st.st_size;
-        free(names[keep]);
-        names[keep] = strdup(nm);
+        names[keep] = names[i];   /* владение переезжает, без strdup */
+        if (keep != i) names[i] = 0;
         keep++;
     }
     cnt = keep;
 
-    FILE *f = fopen(out, "wb");
-    if (!f) { fprintf(stderr, "isc: не создать '%s'\n", out); return 2; }
+    f = fopen(out, "wb");
+    if (!f) { fprintf(stderr, "isc: не создать '%s'\n", out); rc = 2; goto done; }
 
     /* буферы кодека */
-    u8 *in = malloc(BLOCK_RAW), *outb = malloc(PAY_CAP), *dbuf = malloc(BLOCK_RAW);
-    i32 *head = malloc((size_t)(1 << 16) * sizeof(i32));
-    i32 *prev = malloc((size_t)BLOCK_RAW * sizeof(i32));
-    u32 *tl = malloc((size_t)BLOCK_RAW * sizeof(u32));
-    u32 *td = malloc((size_t)BLOCK_RAW * sizeof(u32));
-    if (!in || !outb || !head || !prev || !tl || !td || !dbuf) return 2;
+    in = malloc(BLOCK_RAW);
+    outb = malloc(PAY_CAP);
+    dbuf = malloc(BLOCK_RAW);
+    head = malloc((size_t)(1 << 16) * sizeof(i32));
+    prev = malloc((size_t)BLOCK_RAW * sizeof(i32));
+    tl = malloc((size_t)BLOCK_RAW * sizeof(u32));
+    td = malloc((size_t)BLOCK_RAW * sizeof(u32));
+    if (!in || !outb || !head || !prev || !tl || !td || !dbuf) { rc = 2; goto done; }
     lzi_init();
 
     u32 mcap = 16;
     while (mcap < (u32)(cnt + 1) * 2) mcap <<= 1;
-    FPE *map = calloc(mcap, sizeof(FPE));
-    u64 *fps = calloc(cnt ? cnt : 1, sizeof(u64));
-    u32 *link_to = calloc(cnt ? cnt : 1, sizeof(u32));   /* 0 = не ссылка, иначе индекс цели + 1 */
+    map = calloc(mcap, sizeof(FPE));
+    fps = calloc(cnt ? cnt : 1, sizeof(u64));
+    link_to = calloc(cnt ? cnt : 1, sizeof(u32));   /* 0 = не ссылка, иначе индекс цели + 1 */
+    if (!map || !fps || !link_to) { rc = 2; goto done; }
 
     /* проход 1: отпечатки и дедуп — до записи, чтобы точно знать число блоков */
     u64 nb_est = 0;
     for (size_t i = 0; i < cnt; i++) {
-        FILE *src = fopen(names[i], "rb");
+        src = fopen(names[i], "rb");
         if (!src) { fprintf(stderr, "isc: пропал '%s'\n", names[i]); continue; }
         u64 fp = 0x1CA7C0DEDEC0DE17ull;
         size_t rn;
         while ((rn = fread(in, 1, BLOCK_RAW, src)) > 0) fp = isum64_u(fp, in, rn);
         fclose(src);
+        src = NULL;
         fps[i] = fp;
         u64 slot = fp_slot(map, mcap, fp, sizes[i]);
         if (map[slot].used) { link_to[i] = map[slot].idx + 1; continue; }
@@ -120,8 +138,9 @@ int arch_write(const char *out, char **paths, size_t npaths, int level, int mode
     st32(hdr + 24, isum32(hdr, 24));
     fwrite(hdr, 1, HDR_SIZE, f);
 
-    u64 *ent_off = calloc(cnt ? cnt : 1, sizeof(u64));
-    size_t *nlen = calloc(cnt ? cnt : 1, sizeof(size_t));
+    ent_off = calloc(cnt ? cnt : 1, sizeof(u64));
+    nlen = calloc(cnt ? cnt : 1, sizeof(size_t));
+    if (!ent_off || !nlen) { rc = 2; goto done; }
     for (size_t i = 0; i < cnt; i++) {
         ent_off[i] = (u64)ftello(f);
         nlen[i] = strlen(names[i]);
@@ -146,18 +165,18 @@ int arch_write(const char *out, char **paths, size_t npaths, int level, int mode
                         sizes[i], 0, fps[i], 0, link_to[i] - 1);
             continue;
         }
-        FILE *src = fopen(names[i], "rb");
+        src = fopen(names[i], "rb");
         if (!src) continue;
         u64 dstart = data_pos;
         u32 nb = 0;
         u8 rec_first = R_STORE;
         size_t rn;
         while ((rn = fread(in, 1, BLOCK_RAW, src)) > 0) {
-            if (gblock >= nb_est) { fprintf(stderr, "isc: файл изменился при упаковке\n"); return 2; }
+            if (gblock >= nb_est) { fprintf(stderr, "isc: файл изменился при упаковке\n"); rc = 2; goto done; }
             u8 rec = 0;
             size_t psz = block_encode(in, rn, level, mode, outb, PAY_CAP,
                                       &rec, head, prev, tl, td, dbuf);
-            if (wr_at(f, data_pos, outb, psz)) return 2;   /* по смещению: патчи сбивают позицию потока */
+            if (wr_at(f, data_pos, outb, psz)) { rc = 2; goto done; }   /* по смещению: патчи сбивают позицию потока */
             u8 bi[16];
             st32(bi, (u32)psz);
             st32(bi + 4, (u32)rn);
@@ -171,6 +190,7 @@ int arch_write(const char *out, char **paths, size_t npaths, int level, int mode
             data_pos += psz;
         }
         fclose(src);
+        src = NULL;
         patch_entry(f, ent_off[i], nlen[i], T_FILE, rec_first, (u8)level,
                     sizes[i], data_pos - dstart, fps[i], nb, 0);
     }
@@ -179,10 +199,22 @@ int arch_write(const char *out, char **paths, size_t npaths, int level, int mode
     memcpy(ftr, "FSCI", 4);
     st32(ftr + 4, (u32)raw_sum);
     st32(ftr + 12, isum32(ftr, 12));
-    if (wr_at(f, data_pos, ftr, FTR_SIZE)) return 2;
+    if (wr_at(f, data_pos, ftr, FTR_SIZE)) rc = 2;
 
-    fclose(f);
-    return 0;
+done:
+    if (src) fclose(src);
+    if (f) fclose(f);
+    for (size_t i = 0; i < nall; i++) free(names[i]);
+    free(names);
+    free(sizes);
+    free(map);
+    free(fps);
+    free(link_to);
+    free(ent_off);
+    free(nlen);
+    free(in); free(outb); free(dbuf);
+    free(head); free(prev); free(tl); free(td);
+    return rc;
 }
 
 /* ============================ чтение ============================ */
@@ -190,6 +222,13 @@ int arch_write(const char *out, char **paths, size_t npaths, int level, int mode
 static int rd_exact(FILE *f, void *buf, size_t n)
 {
     return fread(buf, 1, n, f) == n ? 0 : -1;
+}
+
+/* ошибка чтения — дочистить то, что успело выделиться */
+static int arch_fail(Arch *a)
+{
+    arch_close(a);
+    return -1;
 }
 
 int arch_open(Arch *a, const char *path)
@@ -201,33 +240,34 @@ int arch_open(Arch *a, const char *path)
     u8 hdr[HDR_SIZE];
     if (rd_exact(a->f, hdr, HDR_SIZE) || memcmp(hdr, ISCF_MAGIC, 4) || hdr[4] != ISCF_VERSION) {
         fprintf(stderr, "isc: это не ISCF v1 архив\n");
-        return -1;
+        return arch_fail(a);
     }
     if (le32(hdr + 24) != isum32(hdr, 24)) {
         fprintf(stderr, "isc: битый заголовок\n");
-        return -1;
+        return arch_fail(a);
     }
     a->nent = le32(hdr + 8);
     a->nblocks = le32(hdr + 12);
     a->flags = hdr[5];
     a->arch_id = le64(hdr + 16);
     a->ents = calloc(a->nent ? a->nent : 1, sizeof(AEnt));
+    if (!a->ents) return arch_fail(a);
     u32 nb_sum = 0;
     for (u32 i = 0; i < a->nent; i++) {
         AEnt *e = &a->ents[i];
         u8 b[2];
-        if (rd_exact(a->f, b, 2)) return -1;
+        if (rd_exact(a->f, b, 2)) return arch_fail(a);
         size_t nl = le16(b);
-        if (nl > 4095) return -1;
+        if (nl > 4095) return arch_fail(a);
         e->name = malloc(nl + 1);
-        if (rd_exact(a->f, e->name, nl)) return -1;
+        if (!e->name || rd_exact(a->f, e->name, nl)) return arch_fail(a);
         e->name[nl] = 0;
-        if (!name_ok(e->name)) { fprintf(stderr, "isc: опасное имя '%s'\n", e->name); return -1; }
+        if (!name_ok(e->name)) { fprintf(stderr, "isc: опасное имя '%s'\n", e->name); return arch_fail(a); }
         u8 fx[FX_ALL];
-        if (rd_exact(a->f, fx, FX_ALL)) return -1;
+        if (rd_exact(a->f, fx, FX_ALL)) return arch_fail(a);
         if (le32(fx + 36) != isum32(fx, FX_SIZE)) {
             fprintf(stderr, "isc: битая запись #%u\n", i);
-            return -1;
+            return arch_fail(a);
         }
         e->type = fx[0]; e->recipe = fx[1]; e->level = fx[2];
         e->raw = le64(fx + 4);
@@ -240,25 +280,26 @@ int arch_open(Arch *a, const char *path)
             e->braw = malloc((size_t)e->nblocks * 4 + 4);
             e->bsum = malloc((size_t)e->nblocks * 4 + 4);
             e->brec = malloc((size_t)e->nblocks + 4);
+            if (!e->bcomp || !e->braw || !e->bsum || !e->brec) return arch_fail(a);
             nb_sum += e->nblocks;
         }
     }
     if (nb_sum != a->nblocks) {
         fprintf(stderr, "isc: индекс не сходится\n");
-        return -1;
+        return arch_fail(a);
     }
     for (u32 i = 0; i < a->nent; i++) {
         AEnt *e = &a->ents[i];
         for (u32 b = 0; b < e->nblocks; b++) {
             u8 bi[16];
-            if (rd_exact(a->f, bi, 16)) return -1;
+            if (rd_exact(a->f, bi, 16)) return arch_fail(a);
             e->bcomp[b] = le32(bi);
             e->braw[b] = le32(bi + 4);
             e->bsum[b] = le32(bi + 8);
             e->brec[b] = bi[12];
             if (e->bcomp[b] > PAY_CAP || e->braw[b] > BLOCK_RAW) {
                 fprintf(stderr, "isc: мусор в индексе\n");
-                return -1;
+                return arch_fail(a);
             }
         }
     }
@@ -270,13 +311,13 @@ int arch_open(Arch *a, const char *path)
     }
     /* подвал */
     u8 ftr[FTR_SIZE];
-    if (fseeko(a->f, 0, SEEK_END)) return -1;
+    if (fseeko(a->f, 0, SEEK_END)) return arch_fail(a);
     u64 fsz = (u64)ftello(a->f);
-    if (fsz < HDR_SIZE + FTR_SIZE || fseeko(a->f, (off_t)(fsz - FTR_SIZE), SEEK_SET)) return -1;
-    if (rd_exact(a->f, ftr, FTR_SIZE)) return -1;
+    if (fsz < HDR_SIZE + FTR_SIZE || fseeko(a->f, (off_t)(fsz - FTR_SIZE), SEEK_SET)) return arch_fail(a);
+    if (rd_exact(a->f, ftr, FTR_SIZE)) return arch_fail(a);
     if (memcmp(ftr, "FSCI", 4) || le32(ftr + 12) != isum32(ftr, 12)) {
         fprintf(stderr, "isc: битый подвал — архив обрезан?\n");
-        return -1;
+        return arch_fail(a);
     }
     a->raw_sum = le32(ftr + 4);
     return 0;
@@ -535,6 +576,7 @@ static int par_pass(Arch *a, const char *dir, int jobs, int writeout, u64 *raw_s
 
     for (u32 t = 0; t < started; t++) pthread_join(th[t], 0);
     free(th);
+    free(wa);
     for (u32 s = 0; s < nslots; s++) {
         ssem_kill(&p.fslot[s]);
         ssem_kill(&p.ready[s]);
