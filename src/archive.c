@@ -77,12 +77,12 @@ int arch_write(const char *out, char **paths, size_t npaths, int level, int mode
     if (!f) { fprintf(stderr, "isc: не создать '%s'\n", out); return 2; }
 
     /* буферы кодека */
-    u8 *in = malloc(BLOCK_RAW), *outb = malloc(PAY_CAP);
+    u8 *in = malloc(BLOCK_RAW), *outb = malloc(PAY_CAP), *dbuf = malloc(BLOCK_RAW);
     i32 *head = malloc((size_t)(1 << 16) * sizeof(i32));
     i32 *prev = malloc((size_t)BLOCK_RAW * sizeof(i32));
     u32 *tl = malloc((size_t)BLOCK_RAW * sizeof(u32));
     u32 *td = malloc((size_t)BLOCK_RAW * sizeof(u32));
-    if (!in || !outb || !head || !prev || !tl || !td) return 2;
+    if (!in || !outb || !head || !prev || !tl || !td || !dbuf) return 2;
     lzi_init();
 
     u32 mcap = 16;
@@ -156,7 +156,7 @@ int arch_write(const char *out, char **paths, size_t npaths, int level, int mode
             if (gblock >= nb_est) { fprintf(stderr, "isc: файл изменился при упаковке\n"); return 2; }
             u8 rec = 0;
             size_t psz = block_encode(in, rn, level, mode, outb, PAY_CAP,
-                                      &rec, head, prev, tl, td);
+                                      &rec, head, prev, tl, td, dbuf);
             if (wr_at(f, data_pos, outb, psz)) return 2;   /* по смещению: патчи сбивают позицию потока */
             u8 bi[16];
             st32(bi, (u32)psz);
@@ -296,62 +296,97 @@ void arch_close(Arch *a)
     memset(a, 0, sizeof *a);
 }
 
-/* декодирует запись; out == NULL — только проверка */
-static int emit_entry(Arch *a, u32 idx, FILE *out, u64 *raw_acc)
+/* ======================= параллельный конвейер ======================= */
+
+#include <pthread.h>
+#include <unistd.h>
+
+/* задание: один блок одной записи */
+typedef struct {
+    u32 ent, blk;        /* для сообщений об ошибках */
+    u32 psz, rn, sum, rec;
+    u64 aoff;            /* payload в архиве */
+} Job;
+
+/* мини-семафор: sem_t не переносим (macOS) */
+typedef struct { pthread_mutex_t mu; pthread_cond_t cv; int v; } Ssem;
+
+static void ssem_init(Ssem *s, int v)
 {
-    AEnt *e = &a->ents[idx];
-    u8 *pay = malloc(PAY_CAP), *dec = malloc(BLOCK_RAW);
-    if (!pay || !dec) return -1;
-    u64 off = e->data_base, done = 0;
-    int rc = 0;
-    for (u32 b = 0; b < e->nblocks && !rc; b++) {
-        u32 psz = e->bcomp[b], rn = e->braw[b];
-        if (fseeko(a->f, (off_t)off, SEEK_SET) || rd_exact(a->f, pay, psz)) rc = -1;
-        if (!rc && block_decode(pay, psz, e->brec[b], dec, rn)) {
-            fprintf(stderr, "isc: блок %u записи '%s' не декодируется\n", b, e->name);
-            rc = 3;
-        }
-        if (!rc && isum32(dec, rn) != e->bsum[b]) {
-            fprintf(stderr, "isc: isum не сошёлся в блоке %u записи '%s'\n", b, e->name);
-            rc = 3;
-        }
-        if (!rc) {
-            if (out && fwrite(dec, 1, rn, out) != rn) rc = 2;
-            *raw_acc = isum32_u(*raw_acc, dec, rn);
-            off += psz;
-            done += rn;
-        }
-    }
-    if (!rc && done != e->raw) rc = 3;
-    free(pay);
-    free(dec);
-    return rc;
+    pthread_mutex_init(&s->mu, 0);
+    pthread_cond_init(&s->cv, 0);
+    s->v = v;
+}
+static void ssem_kill(Ssem *s)
+{
+    pthread_mutex_destroy(&s->mu);
+    pthread_cond_destroy(&s->cv);
+}
+static void ssem_wait(Ssem *s)
+{
+    pthread_mutex_lock(&s->mu);
+    while (!s->v) pthread_cond_wait(&s->cv, &s->mu);
+    s->v--;
+    pthread_mutex_unlock(&s->mu);
+}
+static void ssem_post(Ssem *s)
+{
+    pthread_mutex_lock(&s->mu);
+    s->v++;
+    pthread_cond_signal(&s->cv);
+    pthread_mutex_unlock(&s->mu);
 }
 
-int arch_test(Arch *a)
+/* слоты: воркер t владеет слотом t и обрабатывает свои задания (t, t+nslots, ...)
+   строго по возрастанию — главный забирает блоки в порядке заданий (isum32_u
+   некоммутативен), а fslot[t] не даёт воркеру обогнать чтение результата */
+typedef struct {
+    Arch *a;
+    Job *jobs;
+    u32 njobs, nslots;
+    u8 *spay, *sdec;     /* буферы payload и декода на слот */
+    u32 *ssum, *sjid;    /* чексум декода и номер задания в слоте */
+    u8 *serr;
+    Ssem *fslot, *ready; /* per-slot: свободен / готов */
+    int stop;
+} Par;
+
+typedef struct { Par *p; u32 t; } Warg;
+
+static void *par_worker(void *arg)
 {
-    u64 raw = 0;
-    int rc = 0;
-    for (u32 i = 0; i < a->nent && !rc; i++) {
-        AEnt *e = &a->ents[i];
-        if (e->type == T_FILE) {
-            u64 comp_sum = 0;
-            for (u32 b = 0; b < e->nblocks; b++) comp_sum += e->bcomp[b];
-            if (comp_sum != e->comp) rc = 3;
-            else rc = emit_entry(a, i, NULL, &raw);
-        } else if (e->type == T_LINK) {
-            if (e->link >= i || a->ents[e->link].type != T_FILE ||
-                a->ents[e->link].fp != e->fp || a->ents[e->link].raw != e->raw) {
-                fprintf(stderr, "isc: битая ссылка #%u\n", i);
-                rc = 3;
-            }
-        }
+    Warg *w = arg;
+    Par *p = w->p;
+    int fd = fileno(p->a->f);
+    u32 t = w->t;
+    u8 *pay = p->spay + (size_t)t * PAY_CAP;
+    u8 *dec = p->sdec + (size_t)t * BLOCK_RAW;
+    for (u32 i = t; i < p->njobs; i += p->nslots) {
+        if (__atomic_load_n(&p->stop, __ATOMIC_RELAXED)) break;
+        Job *j = &p->jobs[i];
+        ssem_wait(&p->fslot[t]);
+        if (__atomic_load_n(&p->stop, __ATOMIC_RELAXED)) { ssem_post(&p->fslot[t]); break; }
+        int err = pread(fd, pay, j->psz, (off_t)j->aoff) != (ssize_t)j->psz;
+        if (!err && block_decode(pay, j->psz, j->rec, dec, j->rn)) err = 1;
+        else if (!err) p->ssum[t] = isum32(dec, j->rn);
+        p->sjid[t] = i;
+        p->serr[t] = (u8)err;
+        ssem_post(&p->ready[t]);
     }
-    if (!rc && raw != a->raw_sum) {
-        fprintf(stderr, "isc: общая сумма не сошлась\n");
-        rc = 3;
-    }
-    if (!rc) printf("OK: %u записей, блоки целы\n", a->nent);
+    return NULL;
+}
+
+static int copy_file(const char *dst, const char *src)
+{
+    FILE *a = fopen(src, "rb"), *b = fopen(dst, "wb");
+    if (!a || !b) { if (a) fclose(a); if (b) fclose(b); return -1; }
+    u8 buf[65536];
+    size_t rn;
+    while ((rn = fread(buf, 1, sizeof buf, a)) > 0)
+        if (fwrite(buf, 1, rn, b) != rn) break;
+    int rc = ferror(a) || ferror(b) ? -1 : 0;
+    fclose(a);
+    if (fclose(b)) rc = -1;
     return rc;
 }
 
@@ -367,23 +402,226 @@ static void parent_mkdir(const char *path)
     free(d);
 }
 
-int arch_extract(Arch *a, const char *dir)
+/* все блоки через пул; writeout = 0 — только проверка (используется isc t) */
+static int par_pass(Arch *a, const char *dir, int jobs, int writeout, u64 *raw_sum)
 {
-    mkdir_p(dir);
+    u32 njobs = 0;
+    for (u32 i = 0; i < a->nent; i++)
+        if (a->ents[i].type == T_FILE) njobs += a->ents[i].nblocks;
+
+    int rc = 0;
+    u64 *edone = calloc(a->nent ? a->nent : 1, sizeof(u64));
+    Job *jl = malloc((njobs ? njobs : 1) * sizeof(Job));
+    if (!edone || !jl) { free(edone); free(jl); return 2; }
+
+    u32 k = 0;
+    for (u32 i = 0; i < a->nent; i++) {
+        AEnt *e = &a->ents[i];
+        if (e->type != T_FILE) continue;
+        u64 aoff = e->data_base;
+        for (u32 b = 0; b < e->nblocks; b++) {
+            jl[k].ent = i;
+            jl[k].blk = b;
+            jl[k].psz = e->bcomp[b];
+            jl[k].rn = e->braw[b];
+            jl[k].sum = e->bsum[b];
+            jl[k].rec = e->brec[b];
+            jl[k].aoff = aoff;
+            aoff += e->bcomp[b];
+            k++;
+        }
+    }
+
+    if (jobs < 1) jobs = 1;
+    u32 nwork = (u32)jobs;
+    if (nwork > njobs) nwork = njobs;
+    if (nwork < 1) nwork = 1;
+    u32 nslots = nwork;
+
+    Par p;
+    memset(&p, 0, sizeof p);
+    p.a = a;
+    p.jobs = jl;
+    p.njobs = njobs;
+    p.nslots = nslots;
+    p.spay = malloc((size_t)nslots * PAY_CAP);
+    p.sdec = malloc((size_t)nslots * BLOCK_RAW);
+    p.ssum = calloc(nslots, sizeof(u32));
+    p.sjid = calloc(nslots, sizeof(u32));
+    p.serr = calloc(nslots, 1);
+    p.ready = malloc(nslots * sizeof(Ssem));
+    p.fslot = malloc(nslots * sizeof(Ssem));
+    if (!p.spay || !p.sdec || !p.ssum || !p.sjid || !p.serr || !p.ready || !p.fslot) {
+        free(p.spay); free(p.sdec); free(p.ssum); free(p.sjid); free(p.serr); free(p.ready); free(p.fslot);
+        free(edone); free(jl);
+        return 2;
+    }
+    for (u32 s = 0; s < nslots; s++) {
+        ssem_init(&p.fslot[s], 1);   /* слот свободен */
+        ssem_init(&p.ready[s], 0);
+    }
+
+    pthread_t *th = calloc(nwork ? nwork : 1, sizeof(pthread_t));
+    Warg *wa = calloc(nwork ? nwork : 1, sizeof(Warg));
+    u32 started = 0;
+    for (u32 t = 0; t < nwork; t++) {
+        wa[t].p = &p;
+        wa[t].t = t;
+        if (pthread_create(&th[t], 0, par_worker, &wa[t])) break;
+        started++;
+    }
+    if (!started)
+        for (u32 t = 0; t < nwork; t++) {   /* потоков нет — декодируем прямо тут */
+            Warg w = { &p, t };
+            par_worker(&w);
+        }
+
+    /* главный поток: пишет блоки по порядку и ведёт сквозной isum */
+    FILE *o = NULL;
+    u32 cur = 0xFFFFFFFFu;
+    for (u32 i = 0; i < njobs; i++) {
+        Job *j = &jl[i];
+        if (writeout && j->ent != cur) {
+            if (o) {
+                fclose(o);
+                printf("распаковано: %s\n", a->ents[cur].name);
+            }
+            cur = j->ent;
+            char path[4096];
+            snprintf(path, sizeof path, "%s/%s", dir, a->ents[cur].name);
+            parent_mkdir(path);
+            o = fopen(path, "wb");
+            if (!o) {
+                fprintf(stderr, "isc: не создать '%s'\n", path);
+                rc = 2;
+                break;
+            }
+        }
+        u32 t = i % nslots;
+        ssem_wait(&p.ready[t]);
+        if (p.sjid[t] != i) {   /* рассинхрон слотов — внутренней ошибки быть не должно */
+            rc = 2;
+            ssem_post(&p.fslot[t]);
+            break;
+        }
+        if (p.serr[t]) {
+            fprintf(stderr, "isc: блок %u записи '%s' не декодируется\n", j->blk, a->ents[j->ent].name);
+            rc = 3;
+        } else if (p.ssum[t] != j->sum) {
+            fprintf(stderr, "isc: isum не сошёлся в блоке %u записи '%s'\n", j->blk, a->ents[j->ent].name);
+            rc = 3;
+        } else {
+            u8 *dec = p.sdec + (size_t)t * BLOCK_RAW;
+            if (writeout && fwrite(dec, 1, j->rn, o) != j->rn) {
+                fprintf(stderr, "isc: не записать '%s'\n", a->ents[j->ent].name);
+                rc = 2;
+            } else {
+                *raw_sum = isum32_u(*raw_sum, dec, j->rn);
+                edone[j->ent] += j->rn;
+            }
+        }
+        ssem_post(&p.fslot[t]);
+        if (rc) break;
+    }
+    if (writeout && o) {
+        fclose(o);
+        printf("распаковано: %s\n", a->ents[cur].name);
+    }
+    if (rc) {
+        p.stop = 1;
+        /* разбудить воркеров, висящих на своих слотах */
+        for (u32 s = 0; s < nslots; s++) ssem_post(&p.fslot[s]);
+    }
+
+    for (u32 t = 0; t < started; t++) pthread_join(th[t], 0);
+    free(th);
+    for (u32 s = 0; s < nslots; s++) {
+        ssem_kill(&p.fslot[s]);
+        ssem_kill(&p.ready[s]);
+    }
+    free(p.spay); free(p.sdec); free(p.ssum); free(p.sjid); free(p.serr); free(p.ready); free(p.fslot);
+
+    for (u32 i = 0; i < a->nent && !rc; i++)
+        if (a->ents[i].type == T_FILE && edone[i] != a->ents[i].raw) {
+            fprintf(stderr, "isc: запись '%s' распалась\n", a->ents[i].name);
+            rc = 3;
+        }
+    free(edone);
+    free(jl);
+    return rc;
+}
+
+int arch_test(Arch *a, int jobs)
+{
     int rc = 0;
     for (u32 i = 0; i < a->nent && !rc; i++) {
         AEnt *e = &a->ents[i];
+        if (e->type == T_FILE) {
+            u64 comp_sum = 0;
+            for (u32 b = 0; b < e->nblocks; b++) comp_sum += e->bcomp[b];
+            if (comp_sum != e->comp) {
+                fprintf(stderr, "isc: индекс записи '%s' не сходится\n", e->name);
+                rc = 3;
+            }
+        } else if (e->type == T_LINK) {
+            if (e->link >= i || a->ents[e->link].type != T_FILE ||
+                a->ents[e->link].fp != e->fp || a->ents[e->link].raw != e->raw) {
+                fprintf(stderr, "isc: битая ссылка #%u\n", i);
+                rc = 3;
+            }
+        }
+    }
+    u64 raw = 0;
+    if (!rc) rc = par_pass(a, 0, jobs, 0, &raw);
+    if (!rc && raw != a->raw_sum) {
+        fprintf(stderr, "isc: общая сумма не сошлась\n");
+        rc = 3;
+    }
+    if (!rc) printf("OK: %u записей, блоки целы\n", a->nent);
+    return rc;
+}
+
+int arch_extract(Arch *a, const char *dir, int jobs)
+{
+    mkdir_p(dir);
+    for (u32 i = 0; i < a->nent; i++)
+        if (a->ents[i].type == T_DIR) {
+            char path[4096];
+            snprintf(path, sizeof path, "%s/%s", dir, a->ents[i].name);
+            mkdir_p(path);
+        }
+    /* пустые файлы: блоков нет — создаём напрямую */
+    for (u32 i = 0; i < a->nent; i++) {
+        AEnt *e = &a->ents[i];
+        if (e->type != T_FILE || e->nblocks) continue;
         char path[4096];
         snprintf(path, sizeof path, "%s/%s", dir, e->name);
-        if (e->type == T_DIR) { mkdir_p(path); continue; }
-        u32 src = (e->type == T_LINK) ? e->link : i;
         parent_mkdir(path);
         FILE *o = fopen(path, "wb");
-        if (!o) { fprintf(stderr, "isc: не создать '%s'\n", path); return 2; }
-        u64 acc = 0;
-        rc = emit_entry(a, src, o, &acc);
+        if (!o) {
+            fprintf(stderr, "isc: не создать '%s'\n", path);
+            return 2;
+        }
         fclose(o);
-        if (rc) return rc;
+        printf("распаковано: %s\n", e->name);
+    }
+    u64 raw = 0;
+    int rc = par_pass(a, dir, jobs, 1, &raw);
+    if (rc) return rc;
+
+    /* дедуп-ссылки: файл-оригинал уже распакован — копируем */
+    for (u32 i = 0; i < a->nent && !rc; i++) {
+        AEnt *e = &a->ents[i];
+        if (e->type != T_LINK) continue;
+        char dst[4096], src[4096];
+        snprintf(dst, sizeof dst, "%s/%s", dir, e->name);
+        snprintf(src, sizeof src, "%s/%s", dir, a->ents[e->link].name);
+        parent_mkdir(dst);
+        if (copy_file(dst, src)) {
+            fprintf(stderr, "isc: не создать '%s'\n", dst);
+            rc = 2;
+            break;
+        }
         printf("распаковано: %s\n", e->name);
     }
     return rc;

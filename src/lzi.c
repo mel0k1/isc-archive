@@ -17,8 +17,8 @@ static u32 hpos(const u8 *in, size_t q) { return (load32(in + q) * 2654435761u) 
 
 void lzi_init(void)
 {
-    if (inited) return;
-    inited = 1;
+    /* guard под потоки: воркеры зовут block_decode одновременно */
+    if (__atomic_load_n(&inited, __ATOMIC_ACQUIRE)) return;
     /* длины 4..347: слоты 4+2+4+8+16 */
     for (int i = 0; i < 4; i++) { LEN_BASE[i] = (u16)(4 + i); LEN_EBITS[i] = 0; }
     for (int i = 4; i < 6; i++)  { LEN_BASE[i] = (u16)(8 + 2 * (i - 4)); LEN_EBITS[i] = 1; }
@@ -36,6 +36,7 @@ void lzi_init(void)
         base += 2u << e;
         e++;
     }
+    __atomic_store_n(&inited, 1, __ATOMIC_RELEASE);
 }
 
 static int lslot(int len)

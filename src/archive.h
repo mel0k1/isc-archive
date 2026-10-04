@@ -28,7 +28,7 @@ int  arch_write(const char *out, char **paths, size_t npaths, int level, int mod
 int  arch_open(Arch *a, const char *path);
 void arch_close(Arch *a);
 int  arch_list(Arch *a);
-int  arch_test(Arch *a);
-int  arch_extract(Arch *a, const char *dir);
+int  arch_test(Arch *a, int jobs);
+int  arch_extract(Arch *a, const char *dir, int jobs);
 
 #endif
