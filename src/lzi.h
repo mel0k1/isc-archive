@@ -1,9 +1,10 @@
-/* lzi.h — LZI: свой LZ с hash-цепочками и двумя пайплайнами (текст/бинарник) */
+/* lzi.h — LZI: свой LZ с hash-цепочками; LZ2 добавляет rep-дистанции */
 #ifndef LZI_H
 #define LZI_H
 #include "iscf.h"
 #include "bitio.h"
 #include "huff.h"
+#include "risc.h"
 
 typedef struct {
     int chain;   /* длина цепочки */
@@ -15,7 +16,7 @@ typedef struct {
 typedef struct {
     u32 *tl, *td;
     size_t n, cap;
-    u16 fl[LITN_SYMS], fd[DST_SLOTS];
+    u16 fl[LITN_SYMS], fd[DST_SYMS];
 } LZT;
 
 extern u16 LEN_BASE[LEN_SLOTS];
@@ -25,8 +26,10 @@ extern u8  LEN_EBITS[LEN_SLOTS], DST_EBITS[DST_SLOTS];
 void lzi_init(void);
 void lzi_params(int level, int text, LZP *p);
 int  lzi_parse(const u8 *in, size_t n, const LZP *p, LZT *t,
-               i32 *head, i32 *prev);
-int  lzi_emit(const LZT *t, BW *b);
+               i32 *head, i32 *prev, int reps);
+int  lzi_emit(const LZT *t, BW *b);            /* старый поток (рецепты 2/3/4) */
 int  lzi_decode(const u8 *pay, size_t psz, u8 *out, size_t nraw);
+int  lzi_emit2(const LZT *t, u8 *out, size_t cap, size_t *osize);   /* LZ2 */
+int  lzi_decode2(const u8 *pay, size_t psz, u8 *out, size_t nraw);
 
 #endif

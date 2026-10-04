@@ -47,12 +47,10 @@ size_t block_encode(const u8 *in, size_t n, int level, int mode,
     LZT t;
     t.tl = tl; t.td = td; t.cap = n;
 
-    /* базовый LZI-поток */
-    lzi_parse(in, n, &lp, &t, head, prev);
-    BW bw;
-    bw_init(&bw, out, cap);
-    if (lzi_emit(&t, &bw) != 0) { memcpy(out, in, n); *recipe = R_STORE; return n; }
-    size_t ls = bw_flush(&bw);
+    /* LZ2: rep-дистанции + энтрокодек выбирается в потоке */
+    lzi_parse(in, n, &lp, &t, head, prev, 1);
+    size_t ls;
+    if (lzi_emit2(&t, out, cap, &ls) != 0) { memcpy(out, in, n); *recipe = R_STORE; return n; }
 
     /* дельта: шаг с самым низким обвалом энтропии, потом честное сравнение */
     if (mode != M_STORE && !text && m.r < 0.55f && n >= 1024 && dbuf) {
@@ -64,23 +62,20 @@ size_t block_encode(const u8 *in, size_t n, int level, int mode,
         }
         if (step) {
             delta_apply(in, n, step, dbuf);
-            lzi_parse(dbuf, n, &lp, &t, head, prev);
-            BW bw2;
-            bw_init(&bw2, dbuf, n);   /* dbuf уже прочитан парсером — переиспользуем */
-            if (lzi_emit(&t, &bw2) == 0 && !bw2.err) {
-                size_t ds = bw_flush(&bw2);
-                if (ds + 1 < ls && worthy(ds + 1, n)) {
-                    out[0] = (u8)step;
-                    memcpy(out + 1, dbuf, ds);
-                    *recipe = R_DLT;
-                    return ds + 1;
-                }
+            lzi_parse(dbuf, n, &lp, &t, head, prev, 1);
+            size_t ds;
+            /* dbuf уже прочитан парсером — переиспользуем под поток */
+            if (lzi_emit2(&t, dbuf, n, &ds) == 0 && ds + 1 < ls && worthy(ds + 1, n)) {
+                out[0] = (u8)step;
+                memcpy(out + 1, dbuf, ds);
+                *recipe = R_DLT2;
+                return ds + 1;
             }
         }
     }
 
-    if (bw.err || !worthy(ls, n)) { memcpy(out, in, n); *recipe = R_STORE; return n; }
-    *recipe = text ? R_LZT : R_LZB;
+    if (!worthy(ls, n)) { memcpy(out, in, n); *recipe = R_STORE; return n; }
+    *recipe = text ? R_LZT2 : R_LZB2;
     return ls;
 }
 
@@ -97,12 +92,22 @@ int block_decode(const u8 *pay, size_t psz, u8 recipe, u8 *out, size_t n)
     case R_LZT:
     case R_LZB:
         return lzi_decode(pay, psz, out, n);
+    case R_LZT2:
+    case R_LZB2:
+        return lzi_decode2(pay, psz, out, n);
     case R_DLT:
         if (psz < 1) return -1;
         int st = pay[0];
         if (st != 1 && st != 2 && st != 4 && st != 8) return -1;
         if (lzi_decode(pay + 1, psz - 1, out, n)) return -1;
         for (size_t i = (size_t)st; i < n; i++) out[i] = (u8)(out[i] + out[i - st]);
+        return 0;
+    case R_DLT2:
+        if (psz < 1) return -1;
+        int st2 = pay[0];
+        if (st2 != 1 && st2 != 2 && st2 != 4 && st2 != 8) return -1;
+        if (lzi_decode2(pay + 1, psz - 1, out, n)) return -1;
+        for (size_t i = (size_t)st2; i < n; i++) out[i] = (u8)(out[i] + out[i - st2]);
         return 0;
     default:
         return -1;

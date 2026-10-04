@@ -120,46 +120,67 @@ int hf_dec(const HF *h, BR *b)
     return -1;
 }
 
-/* деревья: [u16 total][u8 flag][u16 rlen][payload] — payload жмётся нашим RLE */
-void hf_store_trees(BW *b, const u8 *ll, const u8 *dl)
+/* массив длин: [u16 nb][u8 flag][flag=1: u16 rs + rle | flag=0: u16 nb + raw] */
+void hf_store_arr(BW *b, const u8 *arr, size_t nb)
 {
-    u8 arr[TREE_BYTES], tmp[TREE_BYTES + TREE_BYTES / 127 + 4];
-    memcpy(arr, ll, LITN_SYMS);
-    memcpy(arr + LITN_SYMS, dl, DST_SLOTS);
-    bw_byte(b, TREE_BYTES & 0xff);
-    bw_byte(b, TREE_BYTES >> 8);
-    size_t rs = rle_encode(arr, TREE_BYTES, tmp);
-    if (rs < TREE_BYTES) {
+    if (nb > 65535) { b->err = 1; return; }
+    u8 tmp[768];
+    if (nb + nb / 127 + 2 > sizeof tmp) { b->err = 1; return; }
+    bw_byte(b, nb & 0xff);
+    bw_byte(b, nb >> 8);
+    size_t rs = rle_encode(arr, nb, tmp);
+    if (rs < nb && rs <= 65535) {
         bw_byte(b, 1);
         bw_byte(b, (u8)rs);
         bw_byte(b, (u8)(rs >> 8));
         bw_raw(b, tmp, rs);
     } else {
         bw_byte(b, 0);
-        bw_byte(b, TREE_BYTES & 0xff);
-        bw_byte(b, TREE_BYTES >> 8);
-        bw_raw(b, arr, TREE_BYTES);
+        bw_byte(b, (u8)nb);
+        bw_byte(b, (u8)(nb >> 8));
+        bw_raw(b, arr, nb);
     }
+}
+
+int hf_load_arr(BR *b, u8 *arr, size_t nb)
+{
+    /* порядок вызовов не специфицирован — читаем последовательно! */
+    int lo = (int)br_bits(b, 8), hi = (int)br_bits(b, 8);
+    int total = lo | hi << 8;
+    if (total != (int)nb) return -1;
+    u8 flag = (u8)br_bits(b, 8);
+    size_t rs;
+    if (flag == 0) {
+        lo = (int)br_bits(b, 8); hi = (int)br_bits(b, 8);
+        rs = (size_t)(lo | hi << 8);
+        if (rs != nb) return -1;
+        for (size_t i = 0; i < rs; i++) arr[i] = (u8)br_bits(b, 8);
+    } else {
+        lo = (int)br_bits(b, 8); hi = (int)br_bits(b, 8);
+        rs = (size_t)(lo | hi << 8);
+        if (rs > nb + nb / 127 + 4) return -1;
+        u8 tmp[768];
+        if (rs > sizeof tmp) return -1;
+        for (size_t i = 0; i < rs; i++) tmp[i] = (u8)br_bits(b, 8);
+        size_t dc = rle_decode(tmp, rs, arr, nb);
+        if (dc != nb) return -1;
+    }
+    return 0;
+}
+
+/* деревья: два массива длин подряд */
+void hf_store_trees(BW *b, const u8 *ll, const u8 *dl)
+{
+    u8 arr[TREE_BYTES];
+    memcpy(arr, ll, LITN_SYMS);
+    memcpy(arr + LITN_SYMS, dl, DST_SLOTS);
+    hf_store_arr(b, arr, TREE_BYTES);
 }
 
 int hf_load_trees(BR *b, u8 *ll, u8 *dl)
 {
-    u8 arr[TREE_BYTES], tmp[TREE_BYTES + TREE_BYTES / 127 + 4];
-    int total = (int)(br_bits(b, 8) | br_bits(b, 8) << 8);
-    if (total != TREE_BYTES) return -1;
-    u8 flag = (u8)br_bits(b, 8);
-    size_t rs;
-    if (flag == 0) {
-        rs = (size_t)br_bits(b, 8) | (size_t)br_bits(b, 8) << 8;
-        if (rs != TREE_BYTES) return -1;
-        for (size_t i = 0; i < rs; i++) arr[i] = (u8)br_bits(b, 8);
-    } else {
-        rs = (size_t)br_bits(b, 8) | (size_t)br_bits(b, 8) << 8;
-        if (rs > sizeof tmp) return -1;
-        for (size_t i = 0; i < rs; i++) tmp[i] = (u8)br_bits(b, 8);
-        size_t dc = rle_decode(tmp, rs, arr, TREE_BYTES);
-        if (dc != TREE_BYTES) return -1;
-    }
+    u8 arr[TREE_BYTES];
+    if (hf_load_arr(b, arr, TREE_BYTES)) return -1;
     memcpy(ll, arr, LITN_SYMS);
     memcpy(dl, arr + LITN_SYMS, DST_SLOTS);
     for (int i = 0; i < TREE_BYTES; i++) if (arr[i] > HLIM) return -1;

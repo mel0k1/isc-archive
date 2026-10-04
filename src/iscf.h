@@ -23,9 +23,12 @@ typedef int32_t  i32;
 /* рецепты блока — решает маршрутизатор */
 #define R_STORE 0       /* уже сжатые / мелкие / несжимаемые */
 #define R_RLE   1       /* повторяющиеся данные */
-#define R_LZT   2       /* текстовый пайплайн LZI */
-#define R_LZB   3       /* бинарный пайплайн LZI */
-#define R_DLT   4       /* дельта-фильтр + LZI: [шаг 1|2|4|8][поток LZI] */
+#define R_LZT   2       /* текстовый пайплайн LZI (старый, только чтение) */
+#define R_LZB   3       /* бинарный пайплайн LZI (старый, только чтение) */
+#define R_DLT   4       /* дельта + LZI: [шаг 1|2|4|8][поток LZI] (старый) */
+#define R_LZT2  5       /* LZ2 текст: rep-дистанции, энтрокодек в потоке */
+#define R_LZB2  6       /* LZ2 бинарник */
+#define R_DLT2  7       /* LZ2: [шаг 1|2|4|8][поток LZ2] */
 
 /* типы записей */
 #define T_FILE 0
@@ -44,6 +47,12 @@ typedef int32_t  i32;
 #define EOB         256
 #define LITN_SYMS   (LIT_SYMS + 1 + LEN_SLOTS)  /* 291 */
 #define HLIM        15                  /* предел длины кода Хаффмана */
+
+/* LZ2: алфавит дистанций расширен rep-символами, метка rep-матча в td */
+#define DST_SYMS    (DST_SLOTS + 4)     /* 44: 40..43 = rep0..rep3 */
+#define TREE2_BYTES (LITN_SYMS + DST_SYMS)
+#define RISC_ALL    (LITN_SYMS + DST_SYMS)   /* 335: токены + дистанции одним алфавитом */
+#define TD_REP      0x80000000u         /* td[i] = TD_REP | номер rep */
 
 /* le-кодирование (формат определён в little-endian) */
 static inline u16 le16(const u8 *p) { return (u16)(p[0] | p[1] << 8); }

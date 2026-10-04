@@ -2,7 +2,7 @@ CC      ?= cc
 CFLAGS  ?= -O2 -std=c99 -Wall -Wextra -D_FILE_OFFSET_BITS=64 -D_POSIX_C_SOURCE=200809L
 LDLIBS   = -lm -pthread
 
-SRC = src/isum.c src/bitio.c src/rle.c src/huff.c src/lzi.c src/recipe.c src/block.c src/archive.c src/util.c
+SRC = src/isum.c src/bitio.c src/rle.c src/huff.c src/risc.c src/lzi.c src/recipe.c src/block.c src/archive.c src/util.c
 OBJ = $(SRC:.c=.o)
 LIBOBJ = $(filter-out src/main.o,$(OBJ))
 

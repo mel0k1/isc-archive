@@ -79,6 +79,9 @@ static const char *recipe_name(u8 r)
     case R_LZT: return "lz-text";
     case R_LZB: return "lz-bin";
     case R_DLT: return "delta";
+    case R_LZT2: return "lz2-text";
+    case R_LZB2: return "lz2-bin";
+    case R_DLT2: return "lz2-delta";
     }
     return "?";
 }
@@ -178,8 +181,11 @@ static int cmd_i(int argc, char **argv)
     printf("сырой объём: %s\n", raws);
     printf("сжатый:      %s\n", comps);
     if (raw) printf("степень:     %.3fx (%.1f%% от исходного)\n", (double)raw / (double)comp, 100.0 * (double)comp / (double)raw);
-    printf("рецепты:     store %u, rle %u, lz-text %u, lz-bin %u, delta %u\n",
-           rec_cnt[R_STORE], rec_cnt[R_RLE], rec_cnt[R_LZT], rec_cnt[R_LZB], rec_cnt[R_DLT]);
+    printf("рецепты:     store %u, rle %u, lz %u/%u, delta %u/%u\n",
+           rec_cnt[R_STORE], rec_cnt[R_RLE], rec_cnt[R_LZT], rec_cnt[R_LZB],
+           rec_cnt[R_DLT], rec_cnt[R_DLT2]);
+    printf("lz2:         text %u, bin %u, delta %u\n",
+           rec_cnt[R_LZT2], rec_cnt[R_LZB2], rec_cnt[R_DLT2]);
     printf("дедуп:       %s\n", (a.flags & 1) ? "есть" : "нет");
     arch_close(&a);
     return 0;

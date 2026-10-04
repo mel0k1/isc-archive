@@ -23,6 +23,8 @@ typedef struct {
 int  hf_from_freq(HF *h, const u16 *freq, int nsyms);
 int  hf_from_lens(HF *h, const u8 *lens, int nsyms);
 int  hf_dec(const HF *h, BR *b);
+void hf_store_arr(BW *b, const u8 *arr, size_t nb);   /* [u16 nb][флаг][rle|raw] */
+int  hf_load_arr(BR *b, u8 *arr, size_t nb);
 void hf_store_trees(BW *b, const u8 *ll, const u8 *dl);
 int  hf_load_trees(BR *b, u8 *ll, u8 *dl);
 
