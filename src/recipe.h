@@ -7,5 +7,6 @@ typedef struct { float h, p, r; } Metrics;   /* энтропия, доля пе�
 
 void recipe_metrics(const u8 *in, size_t n, Metrics *m);
 int  recipe_is_text(const Metrics *m);
+float recipe_delta_h(const u8 *in, size_t n, int step);  /* энтропия дельты с шагом */
 
 #endif

@@ -43,3 +43,19 @@ void recipe_metrics(const u8 *in, size_t n, Metrics *m)
 }
 
 int recipe_is_text(const Metrics *m) { return m->p >= 0.87f; }
+
+/* энтропия разностей in[i] - in[i-step]: гистограмма на лету, без буфера */
+float recipe_delta_h(const u8 *in, size_t n, int step)
+{
+    if (n <= (size_t)step) return 8.0f;
+    u32 hist[256] = { 0 };
+    size_t m = n - (size_t)step;
+    for (size_t i = 0; i < m; i++) hist[(u8)(in[i + step] - in[i])]++;
+    double h = 0;
+    for (int i = 0; i < 256; i++) {
+        if (!hist[i]) continue;
+        double p = (double)hist[i] / (double)m;
+        h -= p * log2(p);
+    }
+    return (float)h;
+}

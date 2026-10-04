@@ -9,7 +9,7 @@
 
 size_t block_encode(const u8 *in, size_t n, int level, int mode,
                     u8 *out, size_t cap, u8 *recipe, i32 *head, i32 *prev,
-                    u32 *tl, u32 *td);
+                    u32 *tl, u32 *td, u8 *dbuf);
 int    block_decode(const u8 *pay, size_t psz, u8 recipe, u8 *out, size_t n);
 
 #endif

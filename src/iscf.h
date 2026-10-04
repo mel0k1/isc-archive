@@ -25,6 +25,7 @@ typedef int32_t  i32;
 #define R_RLE   1       /* повторяющиеся данные */
 #define R_LZT   2       /* текстовый пайплайн LZI */
 #define R_LZB   3       /* бинарный пайплайн LZI */
+#define R_DLT   4       /* дельта-фильтр + LZI: [шаг 1|2|4|8][поток LZI] */
 
 /* типы записей */
 #define T_FILE 0
