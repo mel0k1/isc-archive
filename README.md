@@ -68,22 +68,22 @@ Huffman trees. Default is `-6`.
 
 ## Benchmarks
 
-Mixed 2.2 MiB corpus (English text, ELF binaries, 16-bit PCM, zeros, repeats, random data),
+Mixed 2.55 MiB corpus (English text, ELF binaries, 16-bit PCM, zeros, repeats, random data),
 median of 3 runs, 2-core x86-64, gcc -O2:
 
 | Format | Size | Ratio | Pack, ms | Unpack, ms | Unpack, MiB/s |
 |----------|-------:|------:|---------:|-----------:|--------------:|
-| isc -1   | 633 KiB | 3.51x | 84  | 12 | 181 |
-| isc -6   | 582 KiB | 3.81x | 112 | 16 | 135 |
-| isc -6 -j  | 582 KiB | 3.81x | 112 | 12 | 181 |
-| isc -9   | 564 KiB | 3.94x | 422 | 11 | 197 |
-| gzip -6  | 634 KiB | 3.58x | 58  | 11 | 197 |
-| xz -6    | 464 KiB | 4.89x | 365 | 14 | 155 |
+| isc -1   | 878 KiB | 2.97x | 139 | 18 | 142 |
+| isc -6   | 831 KiB | 3.14x | 194 | 27 |  94 |
+| isc -6 -j  | 831 KiB | 3.14x | 197 | 18 | 142 |
+| isc -9   | 815 KiB | 3.20x | 6726 | 17 | 150 |
+| gzip -6  | 978 KiB | 2.67x | 72  | 14 | 182 |
+| xz -6    | 725 KiB | 3.60x | 442 | 23 | 111 |
 
-Honest read: `-6` beats gzip's ratio at similar speed; `-9` closes in on xz territory while
-unpacking at the same speed across **all** levels — unpack cost does not depend on pack effort.
+Honest read: `-6` beats gzip's ratio at similar speed; `-9` adds optimal parsing on top and
+unpacks at the same speed across **all** levels — unpack cost does not depend on pack effort.
 Blocks are independent, so `isc x` parallelizes across cores for free (`-j N`, auto by default).
-This is v1.1, the roadmap below is where the ratio is headed.
+This is v1.3, the roadmap below is where the ratio is headed.
 
 Reproduce: `make bench`.
 
@@ -104,11 +104,14 @@ ISCF file
 - **LZI** — LZ with 4-byte hash chains, window = block (1 MiB), lengths 4..347 in its own
   slot alphabet, distances 1..2²⁰ in 40 slots, canonical Huffman (≤ 15-bit codes) with a
   9-bit fast-path LUT; trees are packed with the format's own RLE.
-- **LZ2** — the current core (v1.2): LZI plus **rep distances** — an MRU queue of the last
+- **LZ2** — the current core (v1.2/v1.3): LZI plus **rep distances** — an MRU queue of the last
   4 distances; a rep match references the queue instead of an explicit distance, so
   periodically repeating data costs almost nothing. The entropy backend is chosen per block:
-  canonical Huffman or **RISC** — a house rANS range coder (32-bit state, scale 12, two
-  byte streams: tokens and distances) that shaves the fractional-bit loss of Huffman.
+  canonical Huffman, **RISC** — a house rANS coder (32-bit state, scale 12) — or **RISC v2**,
+  which splits the distance alphabet by match length class and moves every extra bit into a
+  context-coded binary stream. At -9 an **optimal parser** replaces greedy/lazy matching: it
+  prices literal, match and rep choices with the exact RISC v2 cost model and takes the
+  cheapest path through the block.
 - Blocks are independent — the decoder never needs a previous block, which is what parallel
   unpacking builds on (`isc x` uses a thread pool by default; `-j1` turns it off).
 - **delta** — the house pre-filter for numeric data: the router tries steps 1/2/4/8, and a step
@@ -153,11 +156,13 @@ bench/          benchmark vs gzip/xz
 
 ## Roadmap
 
+- [x] adaptive contexts in RISC: distance tables per match length class (v1.3)
+- [x] context-coded extra bits (binary rANS stream) (v1.3)
+- [x] optimal parsing at -9 (v1.3)
+- [ ] literal context modeling (previous byte) — the next xz gap
 - [ ] solid mode: cross-file match window
 - [ ] streaming API for `libisc`
 - [ ] parallel pack (block boundaries complicate a shared match window)
-- [ ] adaptive context modeling for RISC (len→dist, match→match) — the xz gap
-- [ ] optimal parsing at -9
 
 ## License
 
@@ -207,9 +212,9 @@ make bench      # бенчмарк против gzip/xz
 ./isc i arch.isc                         # информация
 ```
 
-**Бенчмарк** (смешанный корпус 2.2 МиБ, медиана 3 прогонов): `isc -6` — степень 3.81x
-(gzip: 3.58x), `isc -9` — 3.94x, `xz -6` — 4.89x; распаковка не зависит от уровня упаковки,
-а `-j` раскладывает её по ядрам.
+**Бенчмарк** (смешанный корпус 2.55 МиБ, медиана 3 прогонов): `isc -6` — степень 3.14x
+(gzip: 2.67x), `isc -9` — 3.20x с оптимальным парсингом, `xz -6` — 3.60x; распаковка не
+зависит от уровня упаковки, а `-j` раскладывает её по ядрам.
 
 **Спецификация формата** (побайтово): [spec/FORMAT.md](spec/FORMAT.md).
 
