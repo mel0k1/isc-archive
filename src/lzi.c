@@ -8,6 +8,15 @@ u16 LEN_BASE[LEN_SLOTS];
 u32 DST_BASE[DST_SLOTS];
 u8  LEN_EBITS[LEN_SLOTS], DST_EBITS[DST_SLOTS];
 
+/* старт контекста экстра-битов слота: контекст бита = LCTX[s] + номер бита */
+u16 LCTX[LEN_SLOTS], DCTX[DST_SLOTS];
+#define EXC_L   98    /* сумма LEN_EBITS: 2*1 + 4*2 + 8*3 + 16*4 */
+#define EXC_D   342   /* сумма DST_EBITS: 2*(1+2+...+18) */
+#define EXC_ALL (EXC_L + EXC_D)
+
+/* класс длины для таблицы дистанций: длинный матч — дальше дистанция */
+static int lcls(int ls) { return ls < 4 ? 0 : ls < 10 ? 1 : ls < 18 ? 2 : 3; }
+
 static int inited;
 
 static u32 load32(const u8 *p)
@@ -38,6 +47,10 @@ void lzi_init(void)
         base += 2u << e;
         e++;
     }
+    u16 c = 0;
+    for (int i = 0; i < LEN_SLOTS; i++) { LCTX[i] = c; c = (u16)(c + LEN_EBITS[i]); }
+    c = 0;
+    for (int i = 0; i < DST_SLOTS; i++) { DCTX[i] = c; c = (u16)(c + DST_EBITS[i]); }
     __atomic_store_n(&inited, 1, __ATOMIC_RELEASE);
 }
 
@@ -382,6 +395,93 @@ static int emit_risc2(const LZT *t, u8 *out, size_t cap, size_t *osize,
     return 0;
 }
 
+/* режим 3: RISC v2 — таблица B по классам длины, экстра-биты бинарным rANS.
+   Раскладка: [mode][табл A][mask][таблы B][карта+f0 контекстов]
+              [u24 lenA][u24 lenB][u24 lenC][C][A][B] */
+static int emit_risc3(const LZT *t, u8 *out, size_t cap, size_t *osize,
+                      const u16 *nfA, const u16 nfB[4][DST_SYMS], const u16 *f0,
+                      const u8 *tb, size_t tsz)
+{
+    u32 cmlA[LITN_SYMS], cmlB[4][DST_SYMS];
+    risc_cml(nfA, LITN_SYMS, cmlA);
+    for (int c = 0; c < 4; c++) risc_cml(nfB[c], DST_SYMS, cmlB[c]);
+
+    BW bw;
+    bw_init(&bw, out, cap);
+    bw_byte(&bw, 3);
+    bw_raw(&bw, tb, tsz);
+    size_t P = bw_flush(&bw);
+    if (bw.err || P + 9 > cap) return -1;
+
+    /* поток B: слоты дистанций, таблица по классу длины матча */
+    RiscEnc eb;
+    risc_enc_init(&eb, out + cap);
+    for (size_t i = t->n; i-- > 0; ) {
+        u32 T = t->tl[i];
+        if (T < 256) continue;
+        u32 D = t->td[i];
+        int ds = (D & TD_REP) ? (int)(DST_SLOTS + (D & 3)) : dslot(D);
+        int cls = lcls(lslot((int)(T - 256)));
+        risc_put(&eb, cmlB[cls][ds], nfB[cls][ds]);
+    }
+    risc_flush(&eb);
+    size_t ptrB = (size_t)(eb.ptr - out);
+
+    /* поток C: экстра-биты. Декодер читает MSB вперёд — кодируем с хвоста,
+       внутри матча сначала дистанция, потом длина (обратный порядок) */
+    RiscEnc ec;
+    risc_enc_init(&ec, out + ptrB);
+    for (size_t i = t->n; i-- > 0; ) {
+        u32 T = t->tl[i];
+        if (T < 256) continue;
+        int ls = lslot((int)(T - 256));
+        u32 D = t->td[i];
+        if (!(D & TD_REP)) {
+            int ds = dslot(D);
+            int e = DST_EBITS[ds];
+            u32 ev = D - DST_BASE[ds];
+            for (int k = e - 1; k >= 0; k--)
+                riscb_put(&ec, f0[EXC_L + DCTX[ds] + (e - 1 - k)], (ev >> k) & 1);
+        }
+        int e = LEN_EBITS[ls];
+        u32 ev = T - 256 - LEN_BASE[ls];
+        for (int k = e - 1; k >= 0; k--)
+            riscb_put(&ec, f0[LCTX[ls] + (e - 1 - k)], (ev >> k) & 1);
+    }
+    risc_flush(&ec);
+    size_t ptrC = (size_t)(ec.ptr - out);
+
+    /* поток A: токены, EOB декодируется последним — кодируем первым */
+    RiscEnc ea;
+    risc_enc_init(&ea, out + ptrC);
+    risc_put(&ea, cmlA[EOB], nfA[EOB]);
+    for (size_t i = t->n; i-- > 0; ) {
+        u32 T = t->tl[i];
+        if (T < 256) { risc_put(&ea, cmlA[T], nfA[T]); continue; }
+        int s = 257 + lslot((int)(T - 256));
+        risc_put(&ea, cmlA[s], nfA[s]);
+    }
+    risc_flush(&ea);
+    if (bw.err) return -1;
+    size_t ptrA = (size_t)(ea.ptr - out);
+    size_t lenA = ptrC - ptrA, lenB = cap - ptrB, lenC = ptrA - ptrC;
+    if ((lenA | lenB | lenC) >> 24) return -1;
+
+    /* три потока лежат подряд — сдвигаем вниз вплотную к заголовку */
+    memmove(out + P + 9, out + ptrA, cap - ptrA);
+    out[P] = (u8)lenA;
+    out[P + 1] = (u8)(lenA >> 8);
+    out[P + 2] = (u8)(lenA >> 16);
+    out[P + 3] = (u8)lenB;
+    out[P + 4] = (u8)(lenB >> 8);
+    out[P + 5] = (u8)(lenB >> 16);
+    out[P + 6] = (u8)lenC;
+    out[P + 7] = (u8)(lenC >> 8);
+    out[P + 8] = (u8)(lenC >> 16);
+    *osize = P + 9 + (cap - ptrA);
+    return 0;
+}
+
 int lzi_emit2(const LZT *t, u8 *out, size_t cap, size_t *osize)
 {
     HF fl, fd;
@@ -397,48 +497,141 @@ int lzi_emit2(const LZT *t, u8 *out, size_t cap, size_t *osize)
 
     u64 hbits = fl.lens[EOB];
     u64 exb = 0;
+    /* счётчики RISC v2: слоты дистанций по классам + контексты экстра-битов */
+    u16 cb[4][DST_SYMS], nfB[4][DST_SYMS];
+    u32 n0[EXC_ALL], n1[EXC_ALL];
+    memset(cb, 0, sizeof cb);
+    memset(n0, 0, sizeof n0);
+    memset(n1, 0, sizeof n1);
     for (size_t i = 0; i < t->n; i++) {
         u32 T = t->tl[i];
         if (T < 256) { hbits += fl.lens[T]; continue; }
         u32 L = T - 256;
-        int s = lslot((int)L);
-        hbits += fl.lens[257 + s];
+        int ls = lslot((int)L);
+        int cls = lcls(ls);
+        hbits += fl.lens[257 + ls];
         u32 D = t->td[i];
-        if (D & TD_REP) hbits += fd.lens[DST_SLOTS + (D & 3)];
-        else {
+        if (D & TD_REP) {
+            hbits += fd.lens[DST_SLOTS + (D & 3)];
+            cb[cls][DST_SLOTS + (D & 3)]++;
+        } else {
             int ds = dslot(D);
-            hbits += fd.lens[ds] + DST_EBITS[ds];
-            exb += DST_EBITS[ds];
+            int e = DST_EBITS[ds];
+            u32 ev = D - DST_BASE[ds];
+            hbits += fd.lens[ds] + e;
+            exb += e;
+            cb[cls][ds]++;
+            u32 *dc = &n0[EXC_L + DCTX[ds]], *dn = &n1[EXC_L + DCTX[ds]];
+            for (int k = 0; k < e; k++)
+                if ((ev >> (e - 1 - k)) & 1) dn[k]++; else dc[k]++;
         }
-        /* в режиме 1 экстры идут в общий бит-поток, в режиме 2 — отдельно */
-        hbits += LEN_EBITS[s];
-        exb += LEN_EBITS[s];
+        /* в режиме 1 экстры в общем бит-потоке, в режиме 3 — в потоке C */
+        int e = LEN_EBITS[ls];
+        u32 ev = L - LEN_BASE[ls];
+        hbits += e;
+        exb += e;
+        u32 *lc = &n0[LCTX[ls]], *ln = &n1[LCTX[ls]];
+        for (int k = 0; k < e; k++)
+            if ((ev >> (e - 1 - k)) & 1) ln[k]++; else lc[k]++;
     }
     u64 hsz = 1 + treesz + (hbits + 7) / 8;
 
-    /* оценка RISC: два отдельных алфавита, как у хаффмана */
-    u16 nfA[LITN_SYMS], nfB[DST_SYMS];
-    u32 cmlA[LITN_SYMS], cmlB[DST_SYMS];
+    /* частоты RISC v2 */
+    u16 nfA[LITN_SYMS];
     if (risc_norm(t->fl, LITN_SYMS, nfA) != 0) return -1;
-    if (risc_norm(t->fd, DST_SYMS, nfB) != 0) return -1;
-    u32 cc = 0;
-    for (int s = 0; s < LITN_SYMS; s++) { cmlA[s] = cc; cc += nfA[s]; }
-    cc = 0;
-    for (int s = 0; s < DST_SYMS; s++) { cmlB[s] = cc; cc += nfB[s]; }
-    double rb = 0;
+    double rbA = 0;
     for (int s = 0; s < LITN_SYMS; s++)
-        if (t->fl[s]) rb += (double)t->fl[s] * log2((double)RISC_TOTAL / nfA[s]);
-    for (int s = 0; s < DST_SYMS; s++)
-        if (t->fd[s]) rb += (double)t->fd[s] * log2((double)RISC_TOTAL / nfB[s]);
-    u8 tb[1050];
+        if (t->fl[s]) rbA += (double)t->fl[s] * log2((double)RISC_TOTAL / nfA[s]);
+
+    /* режим 2: одна таблица B, экстры сырьём */
+    u16 nfB2[DST_SYMS];
+    int have2 = risc_norm(t->fd, DST_SYMS, nfB2) == 0;
+    double rb2 = rbA;
+    if (have2)
+        for (int s = 0; s < DST_SYMS; s++)
+            if (t->fd[s]) rb2 += (double)t->fd[s] * log2((double)RISC_TOTAL / nfB2[s]);
+
+    memset(nfB, 0, sizeof nfB);
+    u8 mask = 0;
+    for (int c = 0; c < 4; c++) {
+        u32 tot = 0;
+        for (int s = 0; s < DST_SYMS; s++) tot += cb[c][s];
+        if (!tot) continue;
+        if (risc_norm(cb[c], DST_SYMS, nfB[c]) != 0) return -1;
+        mask |= (u8)(1u << c);
+    }
+    /* f0 контекстов, 0 = не встречался; в потоке — байт q, f0 = 16q+8 */
+    u16 f0[EXC_ALL];
+    u32 nused = 0;
+    for (int c = 0; c < EXC_ALL; c++) {
+        u32 tot = n0[c] + n1[c];
+        if (!tot) { f0[c] = 0; continue; }
+        u32 v = (u32)((u64)n0[c] * RISC_TOTAL / tot);
+        if (!v) v = 1;
+        if (v >= RISC_TOTAL) v = RISC_TOTAL - 1;
+        u32 q = (v + 8) >> 4;
+        if (q > 255) q = 255;
+        f0[c] = (u16)(q * 16 + 8);
+        nused++;
+    }
+
+    /* оценка RISC v2: потоки A/B плюс бинарный C */
+    double rb = 0, rbC = 0;
+    for (int c = 0; c < 4; c++)
+        if (mask >> c & 1)
+            for (int s = 0; s < DST_SYMS; s++)
+                if (cb[c][s]) rb += (double)cb[c][s] * log2((double)RISC_TOTAL / nfB[c][s]);
+    for (int c = 0; c < EXC_ALL; c++)
+        if (f0[c]) {
+            rbC += (double)n0[c] * log2((double)RISC_TOTAL / f0[c]);
+            rbC += (double)n1[c] * log2((double)RISC_TOTAL / (RISC_TOTAL - f0[c]));
+        }
+    rb += rbA + rbC;
+
+    /* таблицы: A, mask, B по классам, карта + q контекстов */
+    u8 tb[2500];
     size_t tsz = risc_table_store(nfA, LITN_SYMS, tb, sizeof tb);
     if (tsz == (size_t)-1) return -1;
-    size_t tsz2 = risc_table_store(nfB, DST_SYMS, tb + tsz, sizeof tb - tsz);
-    if (tsz2 == (size_t)-1) return -1;
-    tsz += tsz2;
-    u64 rsz = 1 + tsz + 6 + (exb + 7) / 8 + (u64)(rb + 7) / 8 + 8;
+    size_t tszA = tsz;
+    tb[tsz++] = mask;
+    for (int c = 0; c < 4; c++) {
+        if (!(mask >> c & 1)) continue;
+        size_t q = risc_table_store(nfB[c], DST_SYMS, tb + tsz, sizeof tb - tsz);
+        if (q == (size_t)-1) return -1;
+        tsz += q;
+    }
+    u8 bm[EXC_ALL / 8];
+    memset(bm, 0, sizeof bm);
+    for (int c = 0; c < EXC_ALL; c++)
+        if (f0[c]) bm[c >> 3] |= (u8)(1u << (c & 7));
+    if (tsz + sizeof bm + nused > sizeof tb) return -1;
+    memcpy(tb + tsz, bm, sizeof bm);
+    tsz += sizeof bm;
+    for (int c = 0; c < EXC_ALL; c++)
+        if (f0[c]) tb[tsz++] = (u8)(f0[c] >> 4);
+    u64 rsz = 1 + tsz + 9 + (u64)(rb + 7) / 8 + 16;
 
-    if (rsz < hsz) return emit_risc2(t, out, cap, osize, nfA, cmlA, nfB, cmlB, tb, tsz);
+    /* таблицы режима 2: A + одна B */
+    u8 tb2[600];
+    size_t tsz2 = 0;
+    if (have2) {
+        memcpy(tb2, tb, tszA);
+        tsz2 = tszA;
+        size_t q2 = risc_table_store(nfB2, DST_SYMS, tb2 + tsz2, sizeof tb2 - tsz2);
+        if (q2 == (size_t)-1) have2 = 0;
+        else tsz2 += q2;
+    }
+    u64 rsz2 = have2 ? 1 + tsz2 + 6 + (exb + 7) / 8 + (u64)(rb2 + 7) / 8 + 8 : (u64)-1;
+
+    if (have2 && rsz2 <= rsz && rsz2 < hsz) {
+        u32 cmlA2[LITN_SYMS], cmlB2[DST_SYMS];
+        risc_cml(nfA, LITN_SYMS, cmlA2);
+        risc_cml(nfB2, DST_SYMS, cmlB2);
+        return emit_risc2(t, out, cap, osize, nfA, cmlA2, nfB2, cmlB2, tb2, tsz2);
+    }
+    if (rsz < hsz && emit_risc3(t, out, cap, osize, nfA, (const u16 (*)[DST_SYMS])nfB, f0, tb, tsz) == 0) {
+        return 0;
+    }
     return emit_huff2(t, out, cap, osize, &fl, &fd, arr);
 }
 
@@ -518,6 +711,89 @@ int lzi_decode2(const u8 *pay, size_t psz, u8 *out, size_t nraw)
                 u32 D;
                 if (ds >= DST_SLOTS) { D = rep[ds - DST_SLOTS]; rep_move(rep, ds - DST_SLOTS); }
                 else { D = DST_BASE[ds] + br_bits(&ex, DST_EBITS[ds]); rep_push(rep, D); }
+                if (lz_copy(out, &op, nraw, D, L)) return -1;
+            }
+        }
+    } else if (mode == 3) {
+        /* RISC v2: B по классам длины, экстра-биты бинарным rANS (поток C) */
+        const u8 *p = pay + 1, *end = pay + psz;
+        u16 nfA[LITN_SYMS], nfB[4][DST_SYMS];
+        u32 cmlA[LITN_SYMS], cmlB[4][DST_SYMS];
+        size_t used;
+        if (risc_table_load(p, (size_t)(end - p), nfA, LITN_SYMS, &used)) return -1;
+        p += used;
+        if (end - p < 1) return -1;
+        u8 mask = *p++;
+        for (int c = 0; c < 4; c++) {
+            if (mask >> c & 1) {
+                if (risc_table_load(p, (size_t)(end - p), nfB[c], DST_SYMS, &used)) return -1;
+                p += used;
+            } else {
+                /* класс не встречался — заглушка, никогда не декодируется */
+                memset(nfB[c], 0, sizeof nfB[c]);
+                nfB[c][0] = RISC_TOTAL;
+            }
+            risc_cml(nfB[c], DST_SYMS, cmlB[c]);
+        }
+        /* контексты: биткарта, за ней байты q (f0 = 16q+8) по порядку */
+        if (end - p < EXC_ALL / 8) return -1;
+        u16 f0[EXC_ALL];
+        memset(f0, 0, sizeof f0);
+        const u8 *q = p + EXC_ALL / 8;
+        for (int c = 0; c < EXC_ALL; c++) {
+            if (!(p[c >> 3] >> (c & 7) & 1)) continue;
+            if (q >= end) return -1;
+            f0[c] = (u16)((u32)*q << 4 | 8);
+            q++;
+        }
+        p = q;
+        if (end - p < 9) return -1;
+        size_t lenA = (size_t)p[0] | (size_t)p[1] << 8 | (size_t)p[2] << 16;
+        size_t lenB = (size_t)p[3] | (size_t)p[4] << 8 | (size_t)p[5] << 16;
+        size_t lenC = (size_t)p[6] | (size_t)p[7] << 8 | (size_t)p[8] << 16;
+        p += 9;
+        if (lenA + lenB + lenC > (size_t)(end - p)) return -1;
+        const u8 *aB0 = end - lenB, *aA0 = aB0 - lenA, *aC0 = aA0 - lenC;
+        RiscDec rdA;        /* LUT нужен только потоку A */
+        RiscB rbB, rbc;
+        risc_build(&rdA, nfA, LITN_SYMS, cmlA);
+        const u8 *aA = aA0, *aB = aB0, *aC = aC0;
+        if (risc_dec_init(&rdA, &aA, aB0)) return -1;
+        if (riscb_init(&rbB, &aB, end)) return -1;
+        if (riscb_init(&rbc, &aC, aA0)) return -1;
+        for (;;) {
+            int s = risc_get(&rdA, &aA, aB);
+            if (s < 0) return -1;
+            if (s < 256) {
+                if (op >= nraw) return -1;
+                out[op++] = (u8)s;
+            } else if (s == 256) {
+                break;
+            } else {
+                int ls = s - 257;
+                if (ls >= LEN_SLOTS) return -1;
+                u32 L = LEN_BASE[ls];
+                for (int k = 0; k < LEN_EBITS[ls]; k++) {
+                    int b = riscb_get(&rbc, &aC, aA, f0[LCTX[ls] + k]);
+                    if (b < 0) return -1;
+                    L = (L << 1) | (u32)b;
+                }
+                int cls = lcls(ls);
+                int ds = risc_get_sl(nfB[cls], cmlB[cls], DST_SYMS, &rbB.x, &aB, end);
+                if (ds < 0 || ds >= DST_SYMS) return -1;
+                u32 D;
+                if (ds >= DST_SLOTS) { D = rep[ds - DST_SLOTS]; rep_move(rep, ds - DST_SLOTS); }
+                else {
+                    int e = DST_EBITS[ds];
+                    u32 ev = DST_BASE[ds];
+                    for (int k = 0; k < e; k++) {
+                        int b = riscb_get(&rbc, &aC, aA, f0[EXC_L + DCTX[ds] + k]);
+                        if (b < 0) return -1;
+                        ev = (ev << 1) | (u32)b;
+                    }
+                    D = ev;
+                    rep_push(rep, D);
+                }
                 if (lz_copy(out, &op, nraw, D, L)) return -1;
             }
         }

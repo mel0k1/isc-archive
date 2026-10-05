@@ -18,6 +18,16 @@ typedef struct {
 /* кодер: x растёт вверх, байты пишем назад от конца буфера */
 typedef struct { u32 x; u8 *ptr; } RiscEnc;
 
+/* бинарный декод: без LUT, только состояние */
+typedef struct { u32 x; } RiscB;
+
+/* префиксы без LUT — для маленьких алфавитов */
+static inline void risc_cml(const u16 *nf, int nsyms, u32 *cml)
+{
+    u32 c = 0;
+    for (int s = 0; s < nsyms; s++) { cml[s] = c; c += nf[s]; }
+}
+
 int    risc_norm(const u16 *freq, int nsyms, u16 *nf);              /* сумма = 4096 */
 void   risc_build(RiscDec *d, const u16 *nf, int nsyms, u32 *cml);  /* LUT + префиксы */
 size_t risc_table_store(const u16 *nf, int nsyms, u8 *dst, size_t cap);
@@ -49,6 +59,55 @@ static inline int risc_dec_init(RiscDec *d, const u8 **pp, const u8 *end)
     d->x = le32(*pp);
     *pp += 4;
     return d->x >= RISC_LOW ? 0 : -1;
+}
+
+static inline int riscb_init(RiscB *b, const u8 **pp, const u8 *end)
+{
+    if (end - *pp < 4) return -1;
+    b->x = le32(*pp);
+    *pp += 4;
+    return b->x >= RISC_LOW ? 0 : -1;
+}
+
+/* декод без LUT: бинарный поиск по префиксам, алфавит небольшой */
+static inline int risc_get_sl(const u16 *nf, const u32 *cml, int nsyms,
+                              u32 *x, const u8 **pp, const u8 *end)
+{
+    u32 sl = *x & (RISC_TOTAL - 1);
+    int lo = 0, hi = nsyms - 1;
+    while (lo < hi) {
+        int m = (lo + hi + 1) >> 1;
+        if (cml[m] <= sl) lo = m; else hi = m - 1;
+    }
+    u32 f = nf[lo], c = cml[lo];
+    if (!f || sl >= c + f) return -1;
+    *x = f * (*x >> RISC_SCALE) + sl - c;
+    while (*x < RISC_LOW) {
+        if (*pp >= end) return -1;
+        *x = (*x << 8) | *(*pp)++;
+    }
+    return lo;
+}
+
+/* бит с частотой нуля f0 из [1..4095] */
+static inline int riscb_get(RiscB *b, const u8 **pp, const u8 *end, u32 f0)
+{
+    if (!f0 || f0 >= RISC_TOTAL) return -1;
+    u32 sl = b->x & (RISC_TOTAL - 1);
+    int r;
+    if (sl < f0) { r = 0; b->x = f0 * (b->x >> RISC_SCALE) + sl; }
+    else { r = 1; b->x = (RISC_TOTAL - f0) * (b->x >> RISC_SCALE) + sl - f0; }
+    while (b->x < RISC_LOW) {
+        if (*pp >= end) return -1;
+        b->x = (b->x << 8) | *(*pp)++;
+    }
+    return r;
+}
+
+static inline void riscb_put(RiscEnc *e, u32 f0, int bit)
+{
+    if (bit) risc_put(e, f0, RISC_TOTAL - f0);
+    else risc_put(e, 0, f0);
 }
 
 /* символ из потока; pp движется вперёд по байтам ренормализации */

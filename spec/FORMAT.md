@@ -193,6 +193,39 @@ extras stream, then — for matches — a symbol from B: 40..43 are rep matches 
 The encoder computes both backends and keeps the smaller one (RISC tables cost ~0.3 KiB,
 so tiny blocks stay with Huffman).
 
+### mode 3 — RISC v2: length-classed distances, context-coded extras
+
+Two refinements over mode 2. First, stream B is split into four frequency tables selected
+by the **length class** of the match (longer matches tend to reach farther): class 0 —
+length slots 0–3, class 1 — slots 4–9, class 2 — slots 10–17, class 3 — slots 18–33.
+A 1-byte mask tells which classes are present; a missing class is never referenced.
+
+Second, raw extras are replaced by stream C: every extra bit is a binary rANS symbol with
+its own static zero-frequency f0, addressed by the context (kind, slot, bit position) —
+kind 0 for length extras (98 contexts), kind 1 for distance extras (342), 440 total. Bits
+are coded MSB-first within a value. Each f0 is stored as one byte `q` with `f0 = 16·q + 8`;
+unused contexts are not stored at all.
+
+```
+u8    mode = 3
+u8    freq_table_A          291 entries, layout as in mode 2
+u8    class_mask            bit c set = a class table follows
+u8    freq_table_B[c]       44 entries per present class
+u8    context_map           55-byte bitmap of used contexts (bit i = context i)
+u8    q[...]                one byte per used context, ascending; f0 = 16q + 8
+u24   len_A                 byte length of stream A
+u24   len_B                 byte length of stream B
+u24   len_C                 byte length of stream C
+u8    stream_C[len_C]       extra bits, binary RISC, MSB-first per value
+u8    stream_A[len_A]       token symbols, RISC-coded
+u8    stream_B[len_B]       distance slots, table by length class
+```
+
+Per match the decoder reads: length slot from A, its MSB-first extras from C, the distance
+symbol from the match's class table in B, and — for non-rep matches — the MSB-first
+distance extras from C. The encoder estimates modes 1, 2 and 3 from the token statistics
+and keeps the smallest.
+
 ## 9. Footer (16 bytes)
 
 | Offset | Size | Field |
@@ -317,6 +350,34 @@ u8    поток_B[len_B]        символы дистанций, RISC
 
 Энкодер считает оба режима и оставляет меньший (таблицы RISC стоят ~0.3 КиБ, поэтому
 маленькие блоки остаются на Хаффмане).
+
+**Режим 3 — RISC v2: классы длины + контекстные экстра-биты**. Два отличия от режима 2.
+Во-первых, поток B делится на четыре таблицы частот, выбираемых по **классу длины** матча
+(длинный матч обычно уходит дальше): класс 0 — слоты длины 0–3, класс 1 — 4–9,
+класс 2 — 10–17, класс 3 — 18–33; байт-маска говорит, какие классы присутствуют.
+Во-вторых, сырые экстра-биты заменены потоком C: каждый бит — бинарный символ rANS со
+своей статической частотой нуля f0, адресуемой контекстом (вид, слот, номер бита): вид 0 —
+экстры длины (98 контекстов), вид 1 — экстры дистанции (342), всего 440. Биты пишутся
+MSB-вперёд. Частота хранится байтом: q, f0 = 16·q + 8; неиспользуемые контексты не хранятся.
+
+```
+u8    mode = 3
+u8    таблица_A             291 запись, как в режиме 2
+u8    маска_классов         бит c = дальше идёт таблица класса c
+u8    таблица_B[c]          44 записи на каждый присутствующий класс
+u8    карта_контекстов      55-байтовая биткарта используемых контекстов
+u8    q[...]                байт на используемый контекст по возрастанию; f0 = 16q + 8
+u24   len_A                 длина потока A в байтах
+u24   len_B                 длина потока B в байтах
+u24   len_C                 длина потока C в байтах
+u8    поток_C[len_C]        экстра-биты, бинарный RISC, MSB-вперёд
+u8    поток_A[len_A]        символы токенов, RISC
+u8    поток_B[len_B]        слоты дистанций, таблица по классу длины
+```
+
+На каждый матч декодер читает: слот длины из A, его экстры из C (MSB-вперёд), символ
+дистанции из таблицы класса матча в B и — для не-rep матчей — экстра-биты дистанции из C.
+Энкодер оценивает режимы 1, 2 и 3 по статистике токенов и оставляет меньший.
 
 **Подвал**: `"FSCI"`, `raw_sum u32` — isum32 всех сырых байт всех записей-файлов по порядку,
 резерв, `footer_sum u32` — isum32 первых 12 байт подвала.
