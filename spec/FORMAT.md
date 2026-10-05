@@ -226,6 +226,36 @@ symbol from the match's class table in B, and — for non-rep matches — the MS
 distance extras from C. The encoder estimates modes 1, 2 and 3 from the token statistics
 and keeps the smallest.
 
+### mode 4 — literal contexts (previous byte)
+
+Mode 3 plus **context-conditioned coding of stream A**. Every token — literal, length slot or
+EOB — belongs to a context: the high nibble of the previous output byte (0 for the first byte
+of a block). The stream stores up to 16 extra frequency tables of the full 291-symbol
+alphabet; a token whose context has a table is coded through it, any other token falls back
+to the global table of mode 3. Because the per-context tables cover the whole alphabet, the
+decoder picks the table before it knows whether the symbol is a literal or a length slot —
+and both sides agree, since the context depends only on already-decoded output.
+
+The global table is renormalised over the *remainder*: tokens of chosen contexts are
+subtracted from it, so their symbols are never paid for twice. The encoder estimates each
+context's gain against its storage cost (~300 B per table) and stores only the tables that
+pay off; a 2-byte bitmap lists them. The encoder estimates modes 1..4 and keeps the smallest.
+
+```
+u8    mode = 4
+u8    freq_table_A          291 entries, remainder distribution (as in mode 3)
+u8    class_mask            as in mode 3
+u8    freq_table_B[c]       as in mode 3
+u8    context_map           as in mode 3 (55-byte bitmap, extra-bit contexts)
+u8    q[...]                as in mode 3
+u8    literal_map           2-byte bitmap: bit c set = a table for context c follows
+u8    freq_table_C[c]       291 entries per present context, ascending c
+u24   len_A / len_B / len_C as in mode 3
+u8    stream_A[len_A]       token symbols, table by context
+u8    stream_C[len_C]       extra bits, binary RISC, MSB-first per value
+u8    stream_B[len_B]       distance slots, table by length class
+
+
 ## 9. Footer (16 bytes)
 
 | Offset | Size | Field |
@@ -378,6 +408,34 @@ u8    поток_B[len_B]        слоты дистанций, таблица �
 На каждый матч декодер читает: слот длины из A, его экстры из C (MSB-вперёд), символ
 дистанции из таблицы класса матча в B и — для не-rep матчей — экстра-биты дистанции из C.
 Энкодер оценивает режимы 1, 2 и 3 по статистике токенов и оставляет меньший.
+
+**Режим 4 — литеральные контексты (предыдущий байт)**. Режим 3 плюс контекстное кодирование
+потока A. Каждый токен — литерал, слот длины или EOB — принадлежит контексту: старший ниббл
+предыдущего выходного байта (0 для первого байта блока). В потоке лежит до 16 дополнительных
+таблиц частот полного алфавита на 291 символ; токен с контекстом, у которого есть таблица,
+кодируется через неё, остальные — через глобальную таблицу режима 3. Таблицы покрывают весь
+алфавит, поэтому декодер выбирает таблицу до того, как узнает, литерал это или слот длины, —
+и обе стороны согласованы, потому что контекст зависит только от уже декодированного вывода.
+
+Глобальная таблица ренормализуется по остатку: токены выбранных контекстов из неё
+вычитаются, чтобы не платить за их символы дважды. Энкодер оценивает выигрыш каждого
+контекста против стоимости хранения (~300 Б на таблицу) и хранит только окупающиеся;
+2-байтовая биткарта перечисляет их. Энкодер оценивает режимы 1..4 и оставляет меньший.
+
+```
+u8    mode = 4
+u8    таблица_A             291 запись, остаточное распределение (как в режиме 3)
+u8    маска_классов         как в режиме 3
+u8    таблица_B[c]          как в режиме 3
+u8    карта_контекстов      как в режиме 3 (55 байт, контексты экстра-битов)
+u8    q[...]                как в режиме 3
+u8    литерал_карта         2 байта: бит c = дальше идёт таблица контекста c
+u8    таблица_C[c]          291 запись на каждый выбранный контекст, по возрастанию c
+u24   len_A / len_B / len_C как в режиме 3
+u8    поток_A[len_A]        символы токенов, таблица по контексту
+u8    поток_C[len_C]        экстра-биты, бинарный RISC, MSB-вперёд
+u8    поток_B[len_B]        слоты дистанций, таблица по классу длины
+```
 
 **Подвал**: `"FSCI"`, `raw_sum u32` — isum32 всех сырых байт всех записей-файлов по порядку,
 резерв, `footer_sum u32` — isum32 первых 12 байт подвала.

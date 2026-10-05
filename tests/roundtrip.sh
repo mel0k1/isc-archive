@@ -37,6 +37,13 @@ open('counter.i32','wb').write(struct.pack('<50000i', *(i*7 + (i >> 8) for i in 
 open('rep.log','w').write(''.join(
     '2026-10-04 12:00:00 INFO request id=%d ok\n  user=ivan action=ping ms=%d\n' % (i // 100, i % 50)
     for i in range(20000)))
+# hex-дамп — литеральные контексты (старший ниббл prev-байта)
+r = random.Random(21)
+hexpart = lambda: '%02x%02x%02x%02x' % (r.randrange(256), r.randrange(256), r.randrange(256), r.randrange(256))
+open('hexdump.txt','w').write(''.join(
+    '%08x  %s  %s  |%s|\n' % (i * 16, hexpart(), hexpart(),
+    ''.join(chr(r.randrange(0x20, 0x7f)) for _ in range(16)))
+    for i in range(30000)))
 EOF
 
 for L in 1 3 6 9; do

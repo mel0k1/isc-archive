@@ -14,7 +14,7 @@
 
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![language](https://img.shields.io/badge/language-C99-blue)
-![version](https://img.shields.io/badge/version-1.2.0-orange)
+![version](https://img.shields.io/badge/version-1.4.0-orange)
 ![deps](https://img.shields.io/badge/dependencies-0-success)
 ![ci](https://github.com/mel0k1/isc-archive/actions/workflows/ci.yml/badge.svg)
 
@@ -73,17 +73,17 @@ median of 3 runs, 2-core x86-64, gcc -O2:
 
 | Format | Size | Ratio | Pack, ms | Unpack, ms | Unpack, MiB/s |
 |----------|-------:|------:|---------:|-----------:|--------------:|
-| isc -1   | 878 KiB | 2.97x | 139 | 18 | 142 |
-| isc -6   | 831 KiB | 3.14x | 194 | 27 |  94 |
-| isc -6 -j  | 831 KiB | 3.14x | 197 | 18 | 142 |
-| isc -9   | 815 KiB | 3.20x | 6726 | 17 | 150 |
-| gzip -6  | 978 KiB | 2.67x | 72  | 14 | 182 |
-| xz -6    | 725 KiB | 3.60x | 442 | 23 | 111 |
+| isc -1   | 839 KiB | 3.11x | 144 | 21 | 121 |
+| isc -6   | 800 KiB | 3.26x | 298 | 31 |  82 |
+| isc -6 -j  | 800 KiB | 3.26x | 297 | 21 | 121 |
+| isc -9   | 787 KiB | 3.32x | 6643 | 22 | 116 |
+| gzip -6  | 979 KiB | 2.67x | 72  | 14 | 182 |
+| xz -6    | 723 KiB | 3.61x | 460 | 23 | 111 |
 
 Honest read: `-6` beats gzip's ratio at similar speed; `-9` adds optimal parsing on top and
 unpacks at the same speed across **all** levels — unpack cost does not depend on pack effort.
 Blocks are independent, so `isc x` parallelizes across cores for free (`-j N`, auto by default).
-This is v1.3, the roadmap below is where the ratio is headed.
+This is v1.4, the roadmap below is where the ratio is headed.
 
 Reproduce: `make bench`.
 
@@ -109,9 +109,11 @@ ISCF file
   periodically repeating data costs almost nothing. The entropy backend is chosen per block:
   canonical Huffman, **RISC** — a house rANS coder (32-bit state, scale 12) — or **RISC v2**,
   which splits the distance alphabet by match length class and moves every extra bit into a
-  context-coded binary stream. At -9 an **optimal parser** replaces greedy/lazy matching: it
-  prices literal, match and rep choices with the exact RISC v2 cost model and takes the
-  cheapest path through the block.
+  context-coded binary stream. **Literal contexts** (v1.4): every token of stream A can ride a
+  per-context frequency table selected by the high nibble of the previous byte — the encoder
+  keeps a context table only where it beats its ~300 B storage cost. At -9 an **optimal parser**
+  replaces greedy/lazy matching: it prices literal, match and rep choices with the exact
+  RISC v2 cost model and takes the cheapest path through the block.
 - Blocks are independent — the decoder never needs a previous block, which is what parallel
   unpacking builds on (`isc x` uses a thread pool by default; `-j1` turns it off).
 - **delta** — the house pre-filter for numeric data: the router tries steps 1/2/4/8, and a step
@@ -159,7 +161,7 @@ bench/          benchmark vs gzip/xz
 - [x] adaptive contexts in RISC: distance tables per match length class (v1.3)
 - [x] context-coded extra bits (binary rANS stream) (v1.3)
 - [x] optimal parsing at -9 (v1.3)
-- [ ] literal context modeling (previous byte) — the next xz gap
+- [x] literal context modeling (previous byte) (v1.4)
 - [ ] solid mode: cross-file match window
 - [ ] streaming API for `libisc`
 - [ ] parallel pack (block boundaries complicate a shared match window)
@@ -212,9 +214,9 @@ make bench      # бенчмарк против gzip/xz
 ./isc i arch.isc                         # информация
 ```
 
-**Бенчмарк** (смешанный корпус 2.55 МиБ, медиана 3 прогонов): `isc -6` — степень 3.14x
-(gzip: 2.67x), `isc -9` — 3.20x с оптимальным парсингом, `xz -6` — 3.60x; распаковка не
-зависит от уровня упаковки, а `-j` раскладывает её по ядрам.
+**Бенчмарк** (смешанный корпус 2.55 МиБ, медиана 3 прогонов): `isc -6` — степень 3.26x
+(gzip: 2.67x), `isc -9` — 3.32x с оптимальным парсингом и литеральными контекстами,
+`xz -6` — 3.61x; распаковка не зависит от уровня упаковки, а `-j` раскладывает её по ядрам.
 
 **Спецификация формата** (побайтово): [spec/FORMAT.md](spec/FORMAT.md).
 
