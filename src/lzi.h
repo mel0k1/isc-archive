@@ -11,6 +11,7 @@ typedef struct {
     int nice;    /*_stop поиска при такой длине */
     int lazy;    /* пробовать совпадение со следующей позиции */
     int dyn;     /* динамические деревья (иначе статические) */
+    int opt;     /* оптимальный парсинг (уровень 9) */
 } LZP;
 
 typedef struct {
@@ -27,6 +28,8 @@ void lzi_init(void);
 void lzi_params(int level, int text, LZP *p);
 int  lzi_parse(const u8 *in, size_t n, const LZP *p, LZT *t,
                i32 *head, i32 *prev, int reps);
+int  lzi_parse_opt(const u8 *in, size_t n, const LZP *p, LZT *t,
+                   const i32 *head, const i32 *prev);   /* оптимальный (-9) */
 int  lzi_emit(const LZT *t, BW *b);            /* старый поток (рецепты 2/3/4) */
 int  lzi_decode(const u8 *pay, size_t psz, u8 *out, size_t nraw);
 int  lzi_emit2(const LZT *t, u8 *out, size_t cap, size_t *osize);   /* LZ2 */

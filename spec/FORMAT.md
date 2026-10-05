@@ -216,8 +216,8 @@ u8    q[...]                one byte per used context, ascending; f0 = 16q + 8
 u24   len_A                 byte length of stream A
 u24   len_B                 byte length of stream B
 u24   len_C                 byte length of stream C
-u8    stream_C[len_C]       extra bits, binary RISC, MSB-first per value
 u8    stream_A[len_A]       token symbols, RISC-coded
+u8    stream_C[len_C]       extra bits, binary RISC, MSB-first per value
 u8    stream_B[len_B]       distance slots, table by length class
 ```
 
@@ -370,8 +370,8 @@ u8    q[...]                байт на используемый контек�
 u24   len_A                 длина потока A в байтах
 u24   len_B                 длина потока B в байтах
 u24   len_C                 длина потока C в байтах
-u8    поток_C[len_C]        экстра-биты, бинарный RISC, MSB-вперёд
 u8    поток_A[len_A]        символы токенов, RISC
+u8    поток_C[len_C]        экстра-биты, бинарный RISC, MSB-вперёд
 u8    поток_B[len_B]        слоты дистанций, таблица по классу длины
 ```
 

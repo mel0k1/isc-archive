@@ -5,6 +5,7 @@
 #include "recipe.h"
 #include "rle.h"
 #include "lzi.h"
+#include <stdlib.h>
 
 /* порог «и так сжато»: энтропия почти предельная */
 #define H_STORE 7.85f
@@ -51,6 +52,32 @@ size_t block_encode(const u8 *in, size_t n, int level, int mode,
     lzi_parse(in, n, &lp, &t, head, prev, 1);
     size_t ls;
     if (lzi_emit2(&t, out, cap, &ls) != 0) { memcpy(out, in, n); *recipe = R_STORE; return n; }
+
+    /* -9: оптимальный парсинг во второй поток, честное сравнение размеров */
+    if (lp.opt) {
+        u32 *tl2 = malloc(n * 4), *td2 = malloc(n * 4);
+        if (tl2 && td2) {
+            LZT t2;
+            t2.tl = tl2; t2.td = td2; t2.cap = n;
+            t2.n = t.n;
+            memcpy(t2.fl, t.fl, sizeof t.fl);
+            memcpy(t2.fd, t.fd, sizeof t.fd);
+            memcpy(tl2, t.tl, t.n * 4);
+            memcpy(td2, t.td, t.n * 4);
+            size_t ld;
+            u8 *tmp = dbuf;
+            int own = 0;
+            if (!tmp) { tmp = malloc(n); own = 1; }
+            if (tmp && lzi_parse_opt(in, n, &lp, &t2, head, prev) == 0 &&
+                lzi_emit2(&t2, tmp, n, &ld) == 0 && ld < ls) {
+                memcpy(out, tmp, ld);
+                ls = ld;
+            }
+            if (own) free(tmp);
+        }
+        free(tl2);
+        free(td2);
+    }
 
     /* дельта: шаг с самым низким обвалом энтропии, потом честное сравнение */
     if (mode != M_STORE && !text && m.r < 0.55f && n >= 1024 && dbuf) {

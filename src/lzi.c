@@ -1,6 +1,7 @@
 /* lzi.c — LZI: hash-цепочки по 4 байтам; LZ2 — rep-дистанции и RISC */
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 #include "lzi.h"
 #include "rle.h"
 
@@ -89,6 +90,7 @@ void lzi_params(int level, int text, LZP *p)
     /* тексту лень раньше, бинарнику — только с 6-го уровня */
     p->lazy = t->lazy && (text ? level >= 4 : level >= 6);
     p->dyn = t->dyn;
+    p->opt = level >= 9;
 }
 
 static u32 find_best(const u8 *in, size_t n, size_t p, const i32 *head, const i32 *prev,
@@ -167,8 +169,17 @@ static int lz_copy(u8 *out, size_t *op, size_t nraw, u32 D, u32 L)
     return 0;
 }
 
+static int lzi_greedy(const u8 *in, size_t n, const LZP *p, LZT *t,
+                      i32 *head, i32 *prev, int reps);
+
 int lzi_parse(const u8 *in, size_t n, const LZP *p, LZT *t,
               i32 *head, i32 *prev, int reps)
+{
+    return lzi_greedy(in, n, p, t, head, prev, reps);
+}
+
+static int lzi_greedy(const u8 *in, size_t n, const LZP *p, LZT *t,
+                      i32 *head, i32 *prev, int reps)
 {
     u32 rep[4] = { 1, 1, 1, 1 };   /* MRU дистанций */
     t->n = 0;
@@ -215,6 +226,247 @@ int lzi_parse(const u8 *in, size_t n, const LZP *p, LZT *t,
         for (size_t k = i + 1; k < end && k + MIN_MATCH <= n; k++) insert(head, prev, in, k);
         i = end;
     }
+    return 0;
+}
+
+/* --- оптимальный парсинг (-9): DP по ценам из статистики потока --- */
+
+#define PSC  64                  /* цена в 1/64 бита */
+#define P_INF ((u64)-1)
+
+static u32 pbits(u32 f)          /* цена символа с частотой f */
+{
+    return f ? (u32)(log2((double)RISC_TOTAL / f) * PSC) : 12 * PSC;
+}
+
+typedef struct {
+    u32 pa[LITN_SYMS];
+    u32 pb[4][DST_SYMS];
+    u32 l0[EXC_L], l1[EXC_L], d0[EXC_D], d1[EXC_D];
+    u32 le[LEN_SLOTS][16];
+} Price;
+
+/* цена экстра-битов дистанции по контекстам */
+static u32 dex_price(int ds, u32 ev, const Price *pr)
+{
+    int e = DST_EBITS[ds];
+    const u32 *p0 = pr->d0 + DCTX[ds], *p1 = pr->d1 + DCTX[ds];
+    u32 c = 0;
+    for (int k = 0; k < e; k++)
+        c += (ev >> (e - 1 - k)) & 1 ? p1[k] : p0[k];
+    return c;
+}
+
+/* модель цен из статистики потока; smooth — априорная подмешалка для поиска,
+   для сравнения потоков нужна честная (как в lzi_emit2) */
+static void price_build(const LZT *t, Price *pr, int smooth)
+{
+    u16 nfA[LITN_SYMS];
+    if (risc_norm(t->fl, LITN_SYMS, nfA)) {
+        for (int s = 0; s < LITN_SYMS; s++) pr->pa[s] = 12 * PSC;
+    } else {
+        for (int s = 0; s < LITN_SYMS; s++) pr->pa[s] = pbits(nfA[s]);
+    }
+    u16 cb[4][DST_SYMS];
+    u32 n0[EXC_ALL], n1[EXC_ALL];
+    memset(cb, 0, sizeof cb);
+    memset(n0, 0, sizeof n0);
+    memset(n1, 0, sizeof n1);
+    for (size_t i = 0; i < t->n; i++) {
+        u32 T = t->tl[i];
+        if (T < 256) continue;
+        int ls = lslot((int)(T - 256));
+        u32 D = t->td[i];
+        if (D & TD_REP) cb[lcls(ls)][DST_SLOTS + (D & 3)]++;
+        else {
+            int ds = dslot(D);
+            int e = DST_EBITS[ds];
+            u32 ev = D - DST_BASE[ds];
+            cb[lcls(ls)][ds]++;
+            for (int k = 0; k < e; k++)
+                if ((ev >> (e - 1 - k)) & 1) n1[EXC_L + DCTX[ds] + k]++;
+                else n0[EXC_L + DCTX[ds] + k]++;
+        }
+        int e = LEN_EBITS[ls];
+        u32 ev = T - 256 - LEN_BASE[ls];
+        for (int k = 0; k < e; k++)
+            if ((ev >> (e - 1 - k)) & 1) n1[LCTX[ls] + k]++;
+            else n0[LCTX[ls] + k]++;
+    }
+    for (int c = 0; c < 4; c++) {
+        u32 tot = 0;
+        for (int s = 0; s < DST_SYMS; s++) tot += cb[c][s];
+        if (!tot) {
+            /* класс пуст: дорого, чтобы DP не убегал туда */
+            for (int s = 0; s < DST_SYMS; s++) pr->pb[c][s] = 8 * PSC;
+            continue;
+        }
+        u16 cnt[DST_SYMS];
+        for (int s = 0; s < DST_SYMS; s++)
+            cnt[s] = smooth ? (u16)(cb[c][s] + (t->fd[s] + 8) / 16 + 1) : cb[c][s];
+        u16 nf[DST_SYMS];
+        if (risc_norm(cnt, DST_SYMS, nf)) {
+            for (int s = 0; s < DST_SYMS; s++) pr->pb[c][s] = 8 * PSC;
+            continue;
+        }
+        for (int s = 0; s < DST_SYMS; s++) pr->pb[c][s] = pbits(nf[s]);
+    }
+    for (int c = 0; c < EXC_ALL; c++) {
+        u32 tot = n0[c] + n1[c];
+        u32 v = 2048;
+        if (tot) {
+            v = (u32)((u64)n0[c] * RISC_TOTAL / tot);
+            u32 q = (v + 8) >> 4;
+            if (q > 255) q = 255;
+            v = q * 16 + 8;
+        }
+        u32 z = pbits(v), o = pbits(RISC_TOTAL - v);
+        if (c < EXC_L) { pr->l0[c] = z; pr->l1[c] = o; }
+        else { pr->d0[c - EXC_L] = z; pr->d1[c - EXC_L] = o; }
+    }
+    for (int ls = 0; ls < LEN_SLOTS; ls++) {
+        int e = LEN_EBITS[ls];
+        for (int v = 0; v < (1 << e); v++) {
+            u32 c = 0;
+            for (int k = 0; k < e; k++)
+                c += (v >> (e - 1 - k)) & 1 ? pr->l1[LCTX[ls] + k] : pr->l0[LCTX[ls] + k];
+            pr->le[ls][v] = c;
+        }
+    }
+}
+
+static int mlen(const u8 *in, size_t n, size_t p, u32 D)
+{
+    size_t maxm = n - p;
+    if (maxm > MAX_MATCH) maxm = MAX_MATCH;
+    const u8 *a = in + p, *b = a - D;
+    u32 m = 0;
+    while (m < maxm && a[m] == b[m]) m++;
+    return (int)m;
+}
+
+typedef struct { u32 src, d; u16 len; u8 isr, rn; } OptEd;
+
+/* оптимальный парсинг: DP по ценам модели жадного потока.
+   Выбор DP/жадный делает вызывающий — по фактическому размеру emit */
+int lzi_parse_opt(const u8 *in, size_t n, const LZP *p, LZT *t,
+            const i32 *head, const i32 *prev)
+{
+    Price P1;
+    price_build(t, &P1, 1);
+
+    /* DP вперёд: цена позиции, ребро назад, rep-очередь лучшего пути */
+    u64 *cost = malloc((n + 1) * sizeof *cost);
+    OptEd *ed = calloc(n + 1, sizeof *ed);
+    u32 (*q)[4] = malloc((n + 1) * sizeof *q);
+    if (!cost || !ed || !q) { free(cost); free(ed); free(q); return 0; }
+    for (size_t j = 0; j <= n; j++) cost[j] = P_INF;
+    cost[0] = 0;
+    q[0][0] = q[0][1] = q[0][2] = q[0][3] = 1;
+
+    for (size_t j = 0; j < n; j++) {
+        u64 c0 = cost[j];
+        u64 c = c0 + P1.pa[in[j]];   /* литерал */
+        if (c < cost[j + 1]) {
+            cost[j + 1] = c;
+            ed[j + 1].src = (u32)j; ed[j + 1].len = 0;
+            memcpy(q[j + 1], q[j], sizeof q[j + 1]);
+        }
+        if (n - j < MIN_MATCH) continue;
+        u32 bm = 0, bD = 0, bisr = 0, brn = 0;
+        u32 maxm = n - j > MAX_MATCH ? MAX_MATCH : (u32)(n - j);
+        /* репы: без слота дистанции и экстр */
+        for (int r = 0; r < 4; r++) {
+            u32 D = q[j][r];
+            if (D > j || in[j] != in[j - D]) continue;
+            int m = mlen(in, n, j, D);
+            if (m < MIN_MATCH) continue;
+            int ls = lslot(m);
+            u64 pc = c0 + P1.pa[257 + ls] + P1.le[ls][m - LEN_BASE[ls]] + P1.pb[lcls(ls)][DST_SLOTS + r];
+            if (pc < cost[j + m]) {
+                cost[j + m] = pc;
+                ed[j + m].src = (u32)j; ed[j + m].len = (u16)m;
+                ed[j + m].isr = 1; ed[j + m].rn = (u8)r; ed[j + m].d = D;
+                memcpy(q[j + m], q[j], sizeof q[j + m]);
+                rep_move(q[j + m], r);
+            }
+            if ((u32)m > bm) { bm = (u32)m; bD = D; bisr = 1; brn = (u32)r; }
+        }
+        /* цепочка хешей: кандидаты короче bm покрыты поддиапазонами лучшего */
+        i32 cnd = head[hpos(in, j)];
+        int tries = p->chain;
+        while (cnd >= 0 && tries-- > 0) {
+            size_t cand = (size_t)cnd;
+            /* цепочки уже полные (жадный вставил весь блок) — впереди j мусор */
+            if (cand >= j) { cnd = prev[cand]; continue; }
+            u32 D = (u32)(j - cand);
+            if (bm >= MIN_MATCH + 1 && in[cand + bm - 1] != in[j + bm - 1]) { cnd = prev[cand]; continue; }
+            int m = mlen(in, n, j, D);
+            if ((u32)m > bm) { bm = (u32)m; bD = D; bisr = 0; brn = 0; }
+            if (m >= MIN_MATCH && (u32)m + 1 >= bm) {
+                int ls = lslot(m);
+                int ds = dslot(D);
+                u64 pc = c0 + P1.pa[257 + ls] + P1.le[ls][m - LEN_BASE[ls]]
+                       + P1.pb[lcls(ls)][ds] + dex_price(ds, D, &P1);
+                if (pc < cost[j + m]) {
+                    cost[j + m] = pc;
+                    ed[j + m].src = (u32)j; ed[j + m].len = (u16)m;
+                    ed[j + m].isr = 0; ed[j + m].d = D;
+                    memcpy(q[j + m], q[j], sizeof q[j + m]);
+                    rep_push(q[j + m], D);
+                }
+            }
+            if ((u32)m >= maxm || (u32)m >= (u32)p->nice) break;
+            cnd = prev[cand];
+        }
+        /* поддиапазоны лучшего матча: та же дистанция, короче (не глубже 64) */
+        if (bm >= MIN_MATCH) {
+            u32 lo = bm - 64;
+            if (lo < MIN_MATCH) lo = MIN_MATCH;
+            u32 dexc = bisr ? 0 : dex_price(dslot(bD), bD, &P1);
+            for (u32 L = lo; L < bm; L++) {
+                int l2 = lslot((int)L);
+                u64 pc = c0 + P1.pa[257 + l2] + P1.le[l2][L - LEN_BASE[l2]]
+                       + (bisr ? P1.pb[lcls(l2)][DST_SLOTS + brn] : P1.pb[lcls(l2)][dslot(bD)] + dexc);
+                if (pc < cost[j + L]) {
+                    cost[j + L] = pc;
+                    ed[j + L].src = (u32)j; ed[j + L].len = (u16)L;
+                    ed[j + L].isr = (u8)bisr; ed[j + L].rn = (u8)brn; ed[j + L].d = bD;
+                    memcpy(q[j + L], q[j], sizeof q[j + L]);
+                    if (bisr) rep_move(q[j + L], (int)brn); else rep_push(q[j + L], bD);
+                }
+            }
+        }
+    }
+
+    /* реконструкция: сколько токенов, потом с хвоста */
+    size_t cnt = 0;
+    for (size_t j = n; j > 0; ) { j = ed[j].src; cnt++; }
+    if (cnt > t->cap) { free(cost); free(ed); free(q); return -1; }
+    t->n = cnt;
+    memset(t->fl, 0, sizeof t->fl);
+    memset(t->fd, 0, sizeof t->fd);
+    size_t idx = cnt;
+    for (size_t j = n; j > 0; ) {
+        u32 s = ed[j].src;
+        idx--;
+        if (ed[j].len) {
+            t->tl[idx] = (u32)ed[j].len + 256;
+            t->td[idx] = ed[j].isr ? (TD_REP | ed[j].rn) : ed[j].d;
+            t->fl[257 + lslot(ed[j].len)]++;
+            if (ed[j].isr) t->fd[DST_SLOTS + ed[j].rn]++;
+            else t->fd[dslot(ed[j].d)]++;
+        } else {
+            t->tl[idx] = in[s];
+            t->td[idx] = 0;
+            t->fl[in[s]]++;
+        }
+        j = s;
+    }
+    t->fl[EOB] = 1;
+    free(cost);
+    free(ed);
+    free(q);
     return 0;
 }
 
@@ -440,12 +692,12 @@ static int emit_risc3(const LZT *t, u8 *out, size_t cap, size_t *osize,
             int ds = dslot(D);
             int e = DST_EBITS[ds];
             u32 ev = D - DST_BASE[ds];
-            for (int k = e - 1; k >= 0; k--)
+            for (int k = 0; k < e; k++)
                 riscb_put(&ec, f0[EXC_L + DCTX[ds] + (e - 1 - k)], (ev >> k) & 1);
         }
         int e = LEN_EBITS[ls];
         u32 ev = T - 256 - LEN_BASE[ls];
-        for (int k = e - 1; k >= 0; k--)
+        for (int k = 0; k < e; k++)
             riscb_put(&ec, f0[LCTX[ls] + (e - 1 - k)], (ev >> k) & 1);
     }
     risc_flush(&ec);
@@ -464,7 +716,7 @@ static int emit_risc3(const LZT *t, u8 *out, size_t cap, size_t *osize,
     risc_flush(&ea);
     if (bw.err) return -1;
     size_t ptrA = (size_t)(ea.ptr - out);
-    size_t lenA = ptrC - ptrA, lenB = cap - ptrB, lenC = ptrA - ptrC;
+    size_t lenA = ptrC - ptrA, lenB = cap - ptrB, lenC = ptrB - ptrC;
     if ((lenA | lenB | lenC) >> 24) return -1;
 
     /* три потока лежат подряд — сдвигаем вниз вплотную к заголовку */
@@ -485,8 +737,14 @@ static int emit_risc3(const LZT *t, u8 *out, size_t cap, size_t *osize,
 int lzi_emit2(const LZT *t, u8 *out, size_t cap, size_t *osize)
 {
     HF fl, fd;
+    /* поток без матчей: пустой алфавит дистанций недопустим */
+    u16 fd2[DST_SYMS];
+    memcpy(fd2, t->fd, sizeof fd2);
+    int anyd = 0;
+    for (int i = 0; i < DST_SYMS; i++) anyd |= fd2[i] != 0;
+    if (!anyd) fd2[0] = 1;
     hf_from_freq(&fl, t->fl, LITN_SYMS);
-    hf_from_freq(&fd, t->fd, DST_SYMS);
+    hf_from_freq(&fd, fd2, DST_SYMS);
 
     /* дерево длин + оценка хаффмана */
     u8 arr[TREE2_BYTES], tr[TREE2_BYTES + TREE2_BYTES / 127 + 8];
@@ -612,7 +870,7 @@ int lzi_emit2(const LZT *t, u8 *out, size_t cap, size_t *osize)
     u64 rsz = 1 + tsz + 9 + (u64)(rb + 7) / 8 + 16;
 
     /* таблицы режима 2: A + одна B */
-    u8 tb2[600];
+    u8 tb2[1100];
     size_t tsz2 = 0;
     if (have2) {
         memcpy(tb2, tb, tszA);
@@ -623,15 +881,18 @@ int lzi_emit2(const LZT *t, u8 *out, size_t cap, size_t *osize)
     }
     u64 rsz2 = have2 ? 1 + tsz2 + 6 + (exb + 7) / 8 + (u64)(rb2 + 7) / 8 + 8 : (u64)-1;
 
-    if (have2 && rsz2 <= rsz && rsz2 < hsz) {
+    int best = 1;
+    u64 bs = hsz;
+    if (have2 && rsz2 < bs) { best = 2; bs = rsz2; }
+    if (rsz < bs) { best = 3; bs = rsz; }
+    if (best == 2) {
         u32 cmlA2[LITN_SYMS], cmlB2[DST_SYMS];
         risc_cml(nfA, LITN_SYMS, cmlA2);
         risc_cml(nfB2, DST_SYMS, cmlB2);
         return emit_risc2(t, out, cap, osize, nfA, cmlA2, nfB2, cmlB2, tb2, tsz2);
     }
-    if (rsz < hsz && emit_risc3(t, out, cap, osize, nfA, (const u16 (*)[DST_SYMS])nfB, f0, tb, tsz) == 0) {
+    if (best == 3 && emit_risc3(t, out, cap, osize, nfA, (const u16 (*)[DST_SYMS])nfB, f0, tb, tsz) == 0)
         return 0;
-    }
     return emit_huff2(t, out, cap, osize, &fl, &fd, arr);
 }
 
@@ -752,17 +1013,18 @@ int lzi_decode2(const u8 *pay, size_t psz, u8 *out, size_t nraw)
         size_t lenB = (size_t)p[3] | (size_t)p[4] << 8 | (size_t)p[5] << 16;
         size_t lenC = (size_t)p[6] | (size_t)p[7] << 8 | (size_t)p[8] << 16;
         p += 9;
-        if (lenA + lenB + lenC > (size_t)(end - p)) return -1;
-        const u8 *aB0 = end - lenB, *aA0 = aB0 - lenA, *aC0 = aA0 - lenC;
+        if (lenA + lenB + lenC != (size_t)(end - p)) return -1;
+        /* потоки лежат [A][C][B] */
+        const u8 *aA0 = p, *aC0 = aA0 + lenA, *aB0 = aC0 + lenC;
         RiscDec rdA;        /* LUT нужен только потоку A */
         RiscB rbB, rbc;
         risc_build(&rdA, nfA, LITN_SYMS, cmlA);
         const u8 *aA = aA0, *aB = aB0, *aC = aC0;
-        if (risc_dec_init(&rdA, &aA, aB0)) return -1;
+        if (risc_dec_init(&rdA, &aA, aC0)) return -1;
         if (riscb_init(&rbB, &aB, end)) return -1;
-        if (riscb_init(&rbc, &aC, aA0)) return -1;
+        if (riscb_init(&rbc, &aC, aB0)) return -1;
         for (;;) {
-            int s = risc_get(&rdA, &aA, aB);
+            int s = risc_get(&rdA, &aA, aC0);
             if (s < 0) return -1;
             if (s < 256) {
                 if (op >= nraw) return -1;
@@ -772,12 +1034,13 @@ int lzi_decode2(const u8 *pay, size_t psz, u8 *out, size_t nraw)
             } else {
                 int ls = s - 257;
                 if (ls >= LEN_SLOTS) return -1;
-                u32 L = LEN_BASE[ls];
+                u32 L = LEN_BASE[ls], lev = 0;
                 for (int k = 0; k < LEN_EBITS[ls]; k++) {
-                    int b = riscb_get(&rbc, &aC, aA, f0[LCTX[ls] + k]);
+                    int b = riscb_get(&rbc, &aC, aB0, f0[LCTX[ls] + k]);
                     if (b < 0) return -1;
-                    L = (L << 1) | (u32)b;
+                    lev = (lev << 1) | (u32)b;
                 }
+                L += lev;
                 int cls = lcls(ls);
                 int ds = risc_get_sl(nfB[cls], cmlB[cls], DST_SYMS, &rbB.x, &aB, end);
                 if (ds < 0 || ds >= DST_SYMS) return -1;
@@ -785,13 +1048,13 @@ int lzi_decode2(const u8 *pay, size_t psz, u8 *out, size_t nraw)
                 if (ds >= DST_SLOTS) { D = rep[ds - DST_SLOTS]; rep_move(rep, ds - DST_SLOTS); }
                 else {
                     int e = DST_EBITS[ds];
-                    u32 ev = DST_BASE[ds];
+                    u32 ev = 0;
                     for (int k = 0; k < e; k++) {
-                        int b = riscb_get(&rbc, &aC, aA, f0[EXC_L + DCTX[ds] + k]);
+                        int b = riscb_get(&rbc, &aC, aB0, f0[EXC_L + DCTX[ds] + k]);
                         if (b < 0) return -1;
                         ev = (ev << 1) | (u32)b;
                     }
-                    D = ev;
+                    D = DST_BASE[ds] + ev;
                     rep_push(rep, D);
                 }
                 if (lz_copy(out, &op, nraw, D, L)) return -1;
