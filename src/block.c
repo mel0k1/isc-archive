@@ -51,7 +51,7 @@ size_t block_encode(const u8 *in, size_t n, int level, int mode,
     /* LZ2: rep-дистанции + энтрокодек выбирается в потоке */
     lzi_parse(in, n, &lp, &t, head, prev, 1);
     size_t ls;
-    if (lzi_emit2(&t, out, cap, &ls) != 0) { memcpy(out, in, n); *recipe = R_STORE; return n; }
+    if (lzi_emit2(in, &t, out, cap, &ls) != 0) { memcpy(out, in, n); *recipe = R_STORE; return n; }
 
     /* -9: оптимальный парсинг во второй поток, честное сравнение размеров */
     if (lp.opt) {
@@ -69,7 +69,7 @@ size_t block_encode(const u8 *in, size_t n, int level, int mode,
             int own = 0;
             if (!tmp) { tmp = malloc(n); own = 1; }
             if (tmp && lzi_parse_opt(in, n, &lp, &t2, head, prev) == 0 &&
-                lzi_emit2(&t2, tmp, n, &ld) == 0 && ld < ls) {
+                lzi_emit2(in, &t2, tmp, n, &ld) == 0 && ld < ls) {
                 memcpy(out, tmp, ld);
                 ls = ld;
             }
@@ -92,7 +92,7 @@ size_t block_encode(const u8 *in, size_t n, int level, int mode,
             lzi_parse(dbuf, n, &lp, &t, head, prev, 1);
             size_t ds;
             /* dbuf уже прочитан парсером — переиспользуем под поток */
-            if (lzi_emit2(&t, dbuf, n, &ds) == 0 && ds + 1 < ls && worthy(ds + 1, n)) {
+            if (lzi_emit2(dbuf, &t, dbuf, n, &ds) == 0 && ds + 1 < ls && worthy(ds + 1, n)) {
                 out[0] = (u8)step;
                 memcpy(out + 1, dbuf, ds);
                 *recipe = R_DLT2;

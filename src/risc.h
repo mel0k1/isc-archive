@@ -29,8 +29,10 @@ static inline void risc_cml(const u16 *nf, int nsyms, u32 *cml)
 }
 
 int    risc_norm(const u16 *freq, int nsyms, u16 *nf);              /* сумма = 4096 */
+int    risc_norm32(const u32 *freq, int nsyms, u16 *nf);            /* то же для u32-счётов */
 void   risc_build(RiscDec *d, const u16 *nf, int nsyms, u32 *cml);  /* LUT + префиксы */
 size_t risc_table_store(const u16 *nf, int nsyms, u8 *dst, size_t cap);
+size_t risc_table_size(const u16 *nf, int nsyms);                   /* байт под store */
 int    risc_table_load(const u8 *src, size_t sz, u16 *nf, int nsyms, size_t *used);
 
 static inline void risc_enc_init(RiscEnc *e, u8 *buf_end)

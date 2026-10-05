@@ -2,12 +2,10 @@
 #include <string.h>
 #include "risc.h"
 
-/* частоты -> натуральные, сумма ровно 4096 */
-int risc_norm(const u16 *freq, int nsyms, u16 *nf)
+/* частоты -> натуральные, сумма ровно 4096; вариант под u32-счёты */
+static void norm_any(u64 tot, const u32 *freq, int nsyms, u16 *nf)
 {
-    u64 tot = 0;
-    for (int i = 0; i < nsyms; i++) tot += freq[i];
-    if (!tot) return -1;
+    if (!tot) { nf[0] = RISC_TOTAL; return; }
     u32 sum = 0;
     for (int i = 0; i < nsyms; i++) {
         u32 q = (u32)((u64)freq[i] * RISC_TOTAL / tot);
@@ -20,18 +18,40 @@ int risc_norm(const u16 *freq, int nsyms, u16 *nf)
         int big = 0;
         for (int i = 1; i < nsyms; i++) if (freq[i] > freq[big]) big = i;
         nf[big] = (u16)(nf[big] + RISC_TOTAL - sum);
-        return 0;
+        return;
     }
     /* избыток — отнимаем у самых жирных nf, но не в ноль */
     while (sum > RISC_TOTAL) {
         int big = -1;
         for (int i = 0; i < nsyms; i++)
             if (nf[i] > 1 && (big < 0 || nf[i] > nf[big])) big = i;
-        if (big < 0) return -1;
+        if (big < 0) return;
         nf[big]--;
         sum--;
     }
-    return 0;
+}
+
+int risc_norm(const u16 *freq, int nsyms, u16 *nf)
+{
+    if (nsyms < 1 || nsyms > 512) return -1;
+    u32 f[512];
+    for (int i = 0; i < nsyms; i++) f[i] = freq[i];
+    u64 tot = 0;
+    for (int i = 0; i < nsyms; i++) tot += f[i];
+    norm_any(tot, f, nsyms, nf);
+    u32 sum = 0;
+    for (int i = 0; i < nsyms; i++) sum += nf[i];
+    return sum == RISC_TOTAL ? 0 : -1;
+}
+
+int risc_norm32(const u32 *freq, int nsyms, u16 *nf)
+{
+    u64 tot = 0;
+    for (int i = 0; i < nsyms; i++) tot += freq[i];
+    norm_any(tot, freq, nsyms, nf);
+    u32 sum = 0;
+    for (int i = 0; i < nsyms; i++) sum += nf[i];
+    return sum == RISC_TOTAL ? 0 : -1;
 }
 
 /* LUT по слотам + исключающие префиксы для кодера */
@@ -61,6 +81,14 @@ size_t risc_table_store(const u16 *nf, int nsyms, u8 *dst, size_t cap)
         else if (f < 255) { dst[o++] = (u8)f; }
         else { dst[o] = 255; dst[o + 1] = (u8)f; dst[o + 2] = (u8)(f >> 8); o += 3; }
     }
+    return o;
+}
+
+/* байт под таблицу без записи: 0 = нет, 255 = u16 дальше */
+size_t risc_table_size(const u16 *nf, int nsyms)
+{
+    size_t o = 0;
+    for (int i = 0; i < nsyms; i++) o += (nf[i] >= 255) ? 3 : 1;
     return o;
 }
 

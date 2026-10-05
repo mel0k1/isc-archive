@@ -32,7 +32,7 @@ int  lzi_parse_opt(const u8 *in, size_t n, const LZP *p, LZT *t,
                    const i32 *head, const i32 *prev);   /* оптимальный (-9) */
 int  lzi_emit(const LZT *t, BW *b);            /* старый поток (рецепты 2/3/4) */
 int  lzi_decode(const u8 *pay, size_t psz, u8 *out, size_t nraw);
-int  lzi_emit2(const LZT *t, u8 *out, size_t cap, size_t *osize);   /* LZ2 */
+int  lzi_emit2(const u8 *in, LZT *t, u8 *out, size_t cap, size_t *osize);  /* LZ2 */
 int  lzi_decode2(const u8 *pay, size_t psz, u8 *out, size_t nraw);
 
 #endif
